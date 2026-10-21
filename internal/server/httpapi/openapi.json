@@ -1,0 +1,836 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Kairos API",
+    "version": "1.18.0",
+    "description": "Kairos job orchestrator REST API."
+  },
+  "servers": [
+    {
+      "url": "/api/v1"
+    }
+  ],
+  "paths": {
+    "/info": {
+      "get": {
+        "summary": "Server identity",
+        "description": "Version, instance id, and whether this replica holds the scheduler lease.",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/auth/status": {
+      "get": {
+        "summary": "Auth status",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/auth/setup": {
+      "post": {
+        "summary": "First-run admin",
+        "responses": {
+          "201": {
+            "description": "Created"
+          }
+        }
+      }
+    },
+    "/auth/login": {
+      "post": {
+        "summary": "Sign in",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/auth/logout": {
+      "post": {
+        "summary": "Sign out",
+        "responses": {
+          "204": {
+            "description": "No content"
+          }
+        }
+      }
+    },
+    "/auth/sso/start": {
+      "post": {
+        "summary": "Start OIDC authorization-code + PKCE",
+        "description": "Returns { url } to the IdP. 400 when SSO is not configured.",
+        "responses": {
+          "200": {
+            "description": "Authorization URL"
+          }
+        }
+      }
+    },
+    "/auth/sso/callback": {
+      "get": {
+        "summary": "OIDC callback",
+        "description": "Exchanges the code, looks up a linked user by IdP sub, sets the session cookie. Unlinked identities redirect with sso_error=unlinked.",
+        "responses": {
+          "302": {
+            "description": "Redirect to / or /?sso_error="
+          }
+        }
+      }
+    },
+    "/jobs": {
+      "get": {
+        "summary": "List jobs",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create job",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Created"
+          }
+        }
+      }
+    },
+    "/jobs/{id}": {
+      "get": {
+        "summary": "Get job",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "put": {
+        "summary": "Update job",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete job",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "No content"
+          }
+        }
+      }
+    },
+    "/jobs/{id}/run": {
+      "post": {
+        "summary": "Run job now",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Accepted"
+          }
+        }
+      }
+    },
+    "/storage-locations": {
+      "get": {
+        "summary": "List storage locations",
+        "description": "The places files live: mounted directories on the server, SFTP hosts, S3 buckets and agent directories. Secret keys are masked.",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a storage location",
+        "description": "Operator. Body: name, kind (mount|sftp|s3|agent), base_path, and per kind ssh_host_id, agent_id, or endpoint/region/bucket/access_key/secret_key/path_style/insecure. The secret key is sealed at rest.",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Created"
+          },
+          "400": {
+            "description": "Invalid"
+          }
+        }
+      }
+    },
+    "/storage-locations/{id}": {
+      "put": {
+        "summary": "Update a storage location",
+        "description": "An empty secret_key keeps the stored one.",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a storage location",
+        "description": "Jobs that reference it keep their settings and fail at run time until repointed.",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "No content"
+          }
+        }
+      }
+    },
+    "/storage-locations/{id}/test": {
+      "post": {
+        "summary": "Test a storage location",
+        "description": "Opens the location from the server and lists its base path. Returns {ok, files, sample} or {ok:false, error}. Agent locations cannot be tested from the server.",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/secret-stores": {
+      "get": {
+        "summary": "List Vault secret stores",
+        "description": "Tokens are masked.",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a Vault secret store",
+        "description": "Operator. Token sealed at rest.",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Created"
+          }
+        }
+      }
+    },
+    "/secret-stores/{id}": {
+      "put": {
+        "summary": "Update a secret store",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a secret store",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "No content"
+          }
+        }
+      }
+    },
+    "/calendars": {
+      "get": {
+        "summary": "List skip-day calendars",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a skip-day calendar",
+        "description": "Operator. Dates are YYYY-MM-DD.",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Created"
+          }
+        }
+      }
+    },
+    "/calendars/{id}": {
+      "put": {
+        "summary": "Update a calendar",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a calendar",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "No content"
+          }
+        }
+      }
+    },
+    "/runs/{id}/approve": {
+      "post": {
+        "summary": "Approve a pending run",
+        "description": "Operator or admin. pending_approval \u2192 queued. 409 if not pending.",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Queued"
+          },
+          "409": {
+            "description": "Not pending"
+          }
+        }
+      }
+    },
+    "/runs/{id}/reject": {
+      "post": {
+        "summary": "Reject a pending run",
+        "description": "Operator or admin. pending_approval \u2192 skipped. 409 if not pending.",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Skipped"
+          },
+          "409": {
+            "description": "Not pending"
+          }
+        }
+      }
+    },
+    "/runs": {
+      "get": {
+        "summary": "List runs",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/logs/search": {
+      "get": {
+        "summary": "Search run logs",
+        "description": "Query q (min 2 chars), optional job_id.",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Hits"
+          }
+        }
+      }
+    },
+    "/workflows": {
+      "get": {
+        "summary": "List workflows",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create workflow",
+        "description": "Body: name, description, enabled, parameters, and the workflow's own schedule (schedule_type manual|cron|interval|oneoff, cron_expr, interval_seconds, oneoff_at, timezone, calendar_id) and file trigger (watch_enabled, watch_location_id, watch_path, watch_interval_seconds). When it fires, one execution queues every root job.",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Created"
+          }
+        }
+      }
+    },
+    "/files": {
+      "get": {
+        "summary": "List staged library files",
+        "description": "Newest first. Duplicate names are allowed; distinguish by created_at.",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      },
+      "post": {
+        "summary": "Upload a library file",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Created"
+          }
+        }
+      }
+    },
+    "/files/{id}/download": {
+      "get": {
+        "summary": "Download a library file",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Attachment"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
+      }
+    },
+    "/files/{id}/content": {
+      "get": {
+        "summary": "View library file as text",
+        "description": "Inline text/plain. Rejects binary and files over 2 MiB.",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Text body"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "413": {
+            "description": "Too large"
+          },
+          "415": {
+            "description": "Not text"
+          }
+        }
+      }
+    },
+    "/export": {
+      "get": {
+        "summary": "Export jobs and workflows as YAML",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "YAML bundle"
+          }
+        }
+      }
+    },
+    "/apply": {
+      "post": {
+        "summary": "Apply YAML (upsert by name)",
+        "description": "Body: { yaml, dry_run }.",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Apply report"
+          }
+        }
+      }
+    },
+    "/git-sync": {
+      "post": {
+        "summary": "Pull git repo and apply",
+        "description": "Body: { dry_run }.",
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Apply report"
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "summary": "This OpenAPI document",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "session": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "kairos_session"
+      },
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "kat_"
+      }
+    }
+  }
+}

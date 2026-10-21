@@ -1,0 +1,11 @@
+.git
+.gitignore
+web/node_modules
+web/dist
+bin
+data
+*.md
+.env
+Makefile
+plan.md
+roadmap.md

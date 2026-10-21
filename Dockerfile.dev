@@ -1,0 +1,11 @@
+# Builder image for dev loops: test, vet, fmt — never builds on the host.
+FROM golang:1.26
+
+# The dev server serves agent binaries for push-install; air rebuilds them
+# into this path on change (see .air.toml).
+RUN mkdir -p /usr/local/share/kairos/agent
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+RUN go install github.com/air-verse/air@latest
+WORKDIR /src
+COPY .air.toml .air.toml
+CMD ["air"]

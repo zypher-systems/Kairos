@@ -1,0 +1,34 @@
+# Binaries
+bin/
+/dist/
+tmp/
+.gocache/
+.gomod/
+*.exe
+
+# Built SPA (regenerated in the Docker build)
+webdist/dist/*
+!webdist/dist/.gitkeep
+
+# Node (web UI)
+web/node_modules/
+web/dist/
+web/.vite/
+e2e/node_modules/
+e2e/test-results/
+e2e/playwright-report/
+
+# Env & secrets
+.env
+*.local.env
+# Only a top-level secrets/ directory; internal/server/secrets is source.
+/secrets/
+
+
+# Logs / data
+*.log
+data/
+
+# Test artifacts
+coverage.out
+e2e/.auth/

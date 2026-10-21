@@ -1,0 +1,218 @@
+@import "tailwindcss";
+@import "@fontsource-variable/onest/wght.css";
+@import "@fontsource-variable/unbounded/wght.css";
+@import "@fontsource/jetbrains-mono/latin-400.css";
+@import "@fontsource/jetbrains-mono/latin-500.css";
+
+/* Dark mode follows the .dark class on <html>, set by lib/theme.tsx from the
+   saved preference. Dark is the default; light and system are options. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Dial design tokens: the Graphite palette. Untinted greys carry the UI,
+   one blue accent carries actions and "happening now", and status colour is
+   spent only on status marks. Soft fills are the accent or status colour at
+   10 to 14%. Text tokens hold 4.5:1 on bg and panel in both themes; `input`
+   holds 3:1 for form control borders. */
+@theme inline {
+  --font-sans: "Onest Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-display: "Unbounded Variable", "Onest Variable", ui-sans-serif, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --color-bg: var(--k-bg);
+  --color-panel: var(--k-panel);
+  --color-raised: var(--k-raised);
+  --color-line: var(--k-line);
+  --color-line-soft: var(--k-line-soft);
+  --color-input: var(--k-input);
+  --color-ink: var(--k-ink);
+  --color-dim: var(--k-dim);
+  --color-faint: var(--k-faint);
+
+  --color-accent: var(--k-accent);
+  --color-accent-soft: var(--k-accent-soft);
+  --color-accent-ink: var(--k-accent);
+  --color-accent-fg: var(--k-accent-fg);
+
+  /* Running is the accent: the brand colour means "happening now". */
+  --color-cyan: var(--k-accent);
+  --color-cyan-soft: var(--k-accent-soft);
+  --color-cyan-ink: var(--k-accent);
+  --color-ok: var(--k-ok);
+  --color-ok-soft: var(--k-ok-soft);
+  --color-ok-fg: var(--k-ok-fg);
+  --color-warn: var(--k-warn);
+  --color-warn-soft: var(--k-warn-soft);
+  --color-danger: var(--k-danger);
+  --color-danger-soft: var(--k-danger-soft);
+  --color-danger-fg: var(--k-danger-fg);
+
+  --color-pro: var(--k-accent);
+  --color-pro-soft: var(--k-accent-soft);
+
+  --color-side: var(--k-side);
+
+  --color-terminal: var(--k-terminal);
+  --color-terminal-ink: #ececef;
+  --color-terminal-dim: #9ca1a9;
+  --color-terminal-err: #ff7d73;
+  --color-terminal-sys: #6c9dff;
+  --color-terminal-warn: #f3b556;
+
+  /* Round geometry: pill buttons, 12px controls, 24px cards. */
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 24px;
+  --radius-2xl: 28px;
+}
+
+:root {
+  color-scheme: light;
+  --k-bg: #f5f6f8;
+  --k-panel: #ffffff;
+  --k-side: #ffffff;
+  --k-raised: #eceef2;
+  --k-line: #e1e4e8;
+  --k-line-soft: #eceef1;
+  --k-input: #858b94;
+  --k-ink: #111317;
+  --k-dim: #5c626c;
+  --k-faint: #5c626c;
+
+  --k-accent: #1f5bd8;
+  --k-accent-fg: #ffffff;
+  --k-ok: #137241;
+  --k-ok-fg: #ffffff;
+  --k-warn: #955905;
+  --k-danger: #b82e27;
+  --k-danger-fg: #ffffff;
+
+  --k-accent-soft: color-mix(in srgb, var(--k-accent) 10%, transparent);
+  --k-ok-soft: color-mix(in srgb, var(--k-ok) 10%, transparent);
+  --k-warn-soft: color-mix(in srgb, var(--k-warn) 10%, transparent);
+  --k-danger-soft: color-mix(in srgb, var(--k-danger) 10%, transparent);
+
+  --k-terminal: #15171a;
+}
+
+.dark {
+  color-scheme: dark;
+  --k-bg: #0c0d0f;
+  --k-panel: #15171a;
+  --k-side: #101114;
+  --k-raised: #212429;
+  --k-line: #25282d;
+  --k-line-soft: #1d1f23;
+  --k-input: #6b717a;
+  --k-ink: #ececef;
+  --k-dim: #9ca1a9;
+  --k-faint: #9ca1a9;
+
+  --k-accent: #6c9dff;
+  --k-accent-fg: #071430;
+  /* Status colours are light in the dark theme, so text on them is dark. */
+  --k-ok: #4fd08f;
+  --k-ok-fg: #04210f;
+  --k-warn: #f3b556;
+  --k-danger: #ff7d73;
+  --k-danger-fg: #1c0503;
+
+  --k-accent-soft: color-mix(in srgb, var(--k-accent) 14%, transparent);
+  --k-ok-soft: color-mix(in srgb, var(--k-ok) 12%, transparent);
+  --k-warn-soft: color-mix(in srgb, var(--k-warn) 12%, transparent);
+  --k-danger-soft: color-mix(in srgb, var(--k-danger) 12%, transparent);
+
+  --k-terminal: #101114;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--color-accent) 28%, transparent);
+}
+
+/* In the base layer so component utilities (focus:outline-none, rings) win. */
+@layer base {
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+  /* Controls inherit the page face; in the base layer so font-mono on a
+     cron, path or key field still wins. */
+  input, textarea, select { font-family: inherit; }
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line) transparent;
+}
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-thumb { background: var(--color-line); border-radius: 8px; }
+*::-webkit-scrollbar-track { background: transparent; }
+
+
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.anim-in { animation: fade-up 0.28s cubic-bezier(0.2, 0.8, 0.2, 1) both; }
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.pulse-dot { animation: pulse-dot 1.6s ease-in-out infinite; }
+
+@keyframes sweep {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(240%); }
+}
+.now-sweep { animation: sweep 2.8s cubic-bezier(0.4, 0, 0.2, 1) infinite; }
+
+.term-scroll { overscroll-behavior: contain; }
+
+/* micro label used for section indices: 01 · GENERAL */
+.micro {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-faint);
+}
+
+.login-scene {
+  width: 100%;
+  max-width: 720px;
+  height: auto;
+  overflow: visible;
+}
+.login-scene .wire { fill: none; stroke: var(--color-line); stroke-width: 1.25; }
+.login-scene .ring { fill: none; stroke: var(--color-line); stroke-width: 1.25; }
+.login-scene .ring-soft { stroke: var(--color-line-soft); }
+.login-scene .tick { stroke: var(--color-dim); stroke-width: 1.4; }
+.login-scene .tick-faint { stroke: var(--color-line); stroke-width: 1; }
+.login-scene .hand { stroke: var(--color-accent); stroke-width: 1.6; stroke-linecap: round; }
+.login-scene .hand-hour { stroke: var(--color-dim); stroke-width: 1.4; stroke-linecap: round; }
+.login-scene .hub { fill: var(--color-accent); }
+.login-scene .node { fill: var(--color-dim); }
+.login-scene .pkt { fill: var(--color-accent); }
+.login-scene .pkt-dim { fill: var(--color-dim); opacity: 0.7; }
+.login-scene .label {
+  fill: var(--color-faint);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  font-family: var(--font-mono);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .login-scene .pkt { display: none; }
+}
