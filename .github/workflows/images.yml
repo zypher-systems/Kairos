@@ -182,9 +182,15 @@ jobs:
           docker buildx imagetools create "${args[@]}"
       - name: Make the package public
         run: |
+          owner="${GITHUB_REPOSITORY_OWNER}"
+          if gh api "/orgs/${owner}" >/dev/null 2>&1; then
+            path="/orgs/${owner}/packages/container/${{ matrix.image }}"
+          else
+            path="/users/${owner}/packages/container/${{ matrix.image }}"
+          fi
           gh api --method PATCH \
             -H "Accept: application/vnd.github+json" \
-            "/orgs/zypher-systems/packages/container/${{ matrix.image }}" \
+            "$path" \
             -f visibility=public
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
