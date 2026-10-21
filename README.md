@@ -11,13 +11,23 @@ Version **1.18.0**. Kairos is open source. Every feature ships with the binary: 
 
 ## Quick start
 
+Images are published to GitHub Container Registry for linux/amd64 and linux/arm64:
+
+- `ghcr.io/zypher-systems/kairos` — server, with the agent binaries it hands to hosts
+- `ghcr.io/zypher-systems/kairos-agent` — the worker
+
+`latest` and the version in the tree (`1.18.0`) track `main`. A git tag `1.18.0` or `v1.18.0` publishes that version. Every push also tags `sha-<commit>`.
+
 ```bash
 cp .env.example .env
 # set KAIROS_SECRET to a long random string, e.g.  openssl rand -hex 32
-make up
+docker compose pull
+docker compose up -d
 ```
 
-Open http://localhost:8080. First visit creates the single admin account.
+Open http://localhost:8080. First visit creates the first admin account.
+
+`make up` builds the server from this tree instead of pulling it.
 
 ```bash
 make down     # stop

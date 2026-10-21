@@ -1,0 +1,190 @@
+name: images
+
+on:
+  push:
+    branches: [main]
+    tags: ["*.*.*"]
+  pull_request:
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: kairos
+          POSTGRES_PASSWORD: kairos
+          POSTGRES_DB: kairos_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U kairos -d kairos_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Version
+        id: ver
+        run: |
+          if [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+            v="${GITHUB_REF#refs/tags/}"
+            v="${v#v}"
+          else
+            v=$(sed -n 's/^var Version = "\(.*\)"/\1/p' internal/version/version.go)
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - name: gofmt
+        run: test -z "$(gofmt -l cmd internal webdist migrations)"
+      - name: vet
+        run: go vet ./...
+      - name: test
+        env:
+          KAIROS_TEST_DB_URL: postgres://kairos:kairos@127.0.0.1:5432/kairos_test?sslmode=disable
+        run: go test ./... -race -count=1 -p 1
+
+  build:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            arch: amd64
+            image: kairos
+            slug: server
+            file: Dockerfile
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+            image: kairos
+            slug: server
+            file: Dockerfile
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            arch: amd64
+            image: kairos-agent
+            slug: agent
+            file: Dockerfile.agent
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+            image: kairos-agent
+            slug: agent
+            file: Dockerfile.agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Image name
+        id: name
+        run: |
+          repo=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          if [ "${{ matrix.image }}" = "kairos" ]; then
+            echo "image=ghcr.io/${repo}" >> "$GITHUB_OUTPUT"
+          else
+            echo "image=ghcr.io/${repo}-agent" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          platforms: ${{ matrix.platform }}
+          build-args: VERSION=${{ needs.test.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.version=${{ needs.test.outputs.version }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }},mode=max
+          outputs: type=image,name=${{ steps.name.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+      - name: Export digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.slug }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [test, build]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - image: kairos
+            slug: server
+          - image: kairos-agent
+            slug: agent
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.slug }}-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish manifest
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          repo=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          if [ "${{ matrix.image }}" = "kairos" ]; then
+            image="ghcr.io/${repo}"
+          else
+            image="ghcr.io/${repo}-agent"
+          fi
+          version="${{ needs.test.outputs.version }}"
+          short="${GITHUB_SHA::7}"
+          args=(-t "${image}:latest" -t "${image}:${version}" -t "${image}:sha-${short}")
+          for digest in *; do
+            args+=("${image}@sha256:${digest}")
+          done
+          docker buildx imagetools create "${args[@]}"
+      - name: Make the package public
+        run: |
+          gh api --method PATCH \
+            -H "Accept: application/vnd.github+json" \
+            "/orgs/zypher-systems/packages/container/${{ matrix.image }}" \
+            -f visibility=public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

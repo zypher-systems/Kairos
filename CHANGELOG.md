@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Kairos is open source under the MIT License. The licensing server, license keys, trials, offline license files, and every feature gate are gone. Accounts, the audit log, YAML and git sync, SSO, retention, log search, SLA alerts, approval gates, Vault secret stores, skip calendars, and extra API replicas are included. A follower stays up and serves HTTP. `KAIROS_LICENSE_KEY`, `KAIROS_LICENSE_FILE`, and `KAIROS_LICENSE_SERVER` are ignored. Existing installs drop the `license_state` and `licenses` tables on the next migration.
+Kairos is open source under the MIT License. Container images publish from GitHub Actions to `ghcr.io/zypher-systems/kairos` and `ghcr.io/zypher-systems/kairos-agent` for linux/amd64 and linux/arm64. The licensing server, license keys, trials, offline license files, and every feature gate are gone. Accounts, the audit log, YAML and git sync, SSO, retention, log search, SLA alerts, approval gates, Vault secret stores, skip calendars, and extra API replicas are included. A follower stays up and serves HTTP. `KAIROS_LICENSE_KEY`, `KAIROS_LICENSE_FILE`, and `KAIROS_LICENSE_SERVER` are ignored. Existing installs drop the `license_state` and `licenses` tables on the next migration.
 
 ## 1.18.0
 
