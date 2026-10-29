@@ -12,7 +12,7 @@ services:
     network_mode: host
     environment:
       KAIROS_HTTP_ADDR: ":${KAIROS_HTTP_PORT:-8080}"
-      KAIROS_DB_URL: ${KAIROS_DB_URL:-postgres://kairos:kairos@127.0.0.1:5432/kairos?sslmode=disable}
+      KAIROS_DB_URL: ${KAIROS_DB_URL:-postgres://kairos:kairos@127.0.0.1:${KAIROS_PG_PORT:-5432}/kairos?sslmode=disable}
       KAIROS_DATA_DIR: /var/lib/kairos
       KAIROS_SECRET: ${KAIROS_SECRET:?set a strong KAIROS_SECRET in .env}
       KAIROS_LOG_LEVEL: ${KAIROS_LOG_LEVEL:-info}
@@ -46,7 +46,7 @@ services:
     network_mode: host
     environment:
       KAIROS_HTTP_ADDR: ":${KAIROS_HA_HTTP_PORT:-8081}"
-      KAIROS_DB_URL: ${KAIROS_DB_URL:-postgres://kairos:kairos@127.0.0.1:5432/kairos?sslmode=disable}
+      KAIROS_DB_URL: ${KAIROS_DB_URL:-postgres://kairos:kairos@127.0.0.1:${KAIROS_PG_PORT:-5432}/kairos?sslmode=disable}
       KAIROS_DATA_DIR: /var/lib/kairos
       KAIROS_SECRET: ${KAIROS_SECRET:?set a strong KAIROS_SECRET in .env}
       KAIROS_LOG_LEVEL: ${KAIROS_LOG_LEVEL:-info}
