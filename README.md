@@ -6,28 +6,107 @@ Version **1.18.0**. Kairos is open source. Every feature ships with the binary: 
 
 ## Requirements
 
-- Docker and Docker Compose
+- A Linux host with Docker Engine and Docker Compose v2. The server uses host networking so jobs can reach SSH/SFTP hosts on your network by IP.
 - A strong `KAIROS_SECRET` (used to encrypt job secrets and SSH credentials at rest)
 
-## Quick start
+## Images
 
-Images are published to GitHub Container Registry for linux/amd64 and linux/arm64:
+Published to GitHub Container Registry for linux/amd64 and linux/arm64:
 
 - `ghcr.io/zypher-systems/kairos` — server, with the agent binaries it hands to hosts
 - `ghcr.io/zypher-systems/kairos-agent` — the worker
 
-`latest` and the version in the tree (`1.18.0`) track `main`. A git tag `1.18.0` or `v1.18.0` publishes that version. Every push also tags `sha-<commit>`.
+`latest` and the current version (`1.18.0`) follow `main`. Every build is also tagged `sha-<commit>`.
+
+## Quick start
+
+No checkout needed. Make a directory and save this as `compose.yaml`:
+
+```yaml
+name: kairos
+
+services:
+  server:
+    image: ghcr.io/zypher-systems/kairos:${KAIROS_VERSION:-latest}
+    restart: unless-stopped
+    # Host networking so jobs can reach SSH/SFTP hosts on your network by IP.
+    network_mode: host
+    environment:
+      KAIROS_HTTP_ADDR: ":${KAIROS_HTTP_PORT:-8080}"
+      KAIROS_DB_URL: postgres://kairos:kairos@127.0.0.1:${KAIROS_PG_PORT:-5432}/kairos?sslmode=disable
+      KAIROS_DATA_DIR: /var/lib/kairos
+      KAIROS_SECRET: ${KAIROS_SECRET:?set a strong KAIROS_SECRET in .env}
+      KAIROS_PUBLIC_URL: ${KAIROS_PUBLIC_URL:-}
+      KAIROS_HTTPS: ${KAIROS_HTTPS:-false}
+      KAIROS_TRUSTED_PROXIES: ${KAIROS_TRUSTED_PROXIES:-}
+      KAIROS_LOG_LEVEL: ${KAIROS_LOG_LEVEL:-info}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - kairos-data:/var/lib/kairos
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${KAIROS_HTTP_PORT:-8080}/healthz | grep -q healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    # Published on loopback only; the host-networked server connects here.
+    ports:
+      - "127.0.0.1:${KAIROS_PG_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: kairos
+      POSTGRES_PASSWORD: kairos
+      POSTGRES_DB: kairos
+    volumes:
+      - kairos-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kairos -d kairos"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  kairos-data:
+  kairos-pg:
+```
+
+Create `.env` next to it with a generated secret, then start:
 
 ```bash
-cp .env.example .env
-# set KAIROS_SECRET to a long random string, e.g.  openssl rand -hex 32
-docker compose pull
+echo "KAIROS_SECRET=$(openssl rand -hex 32)" > .env
 docker compose up -d
 ```
 
 Open http://localhost:8080. First visit creates the first admin account.
 
-`make up` builds the server from this tree instead of pulling it.
+Keep a copy of `KAIROS_SECRET` with your backups. Without it, stored job secrets and SSH credentials cannot be decrypted.
+
+Optional `.env` settings:
+
+```bash
+KAIROS_VERSION=1.18.0       # pin a release instead of latest
+KAIROS_HTTP_PORT=8080       # UI + API port
+KAIROS_PG_PORT=5433         # if something on the host already uses 5432
+KAIROS_PUBLIC_URL=https://kairos.example.com   # behind a reverse proxy
+KAIROS_HTTPS=true           # when users reach Kairos over HTTPS
+TZ=Europe/Berlin            # server default timezone
+```
+
+**Upgrade:** back up (see [docs/runbook.md](docs/runbook.md)), then `docker compose pull && docker compose up -d`. Migrations run on boot.
+
+## From source
+
+```bash
+git clone https://github.com/zypher-systems/Kairos.git && cd Kairos
+cp .env.example .env    # set KAIROS_SECRET
+make up                 # builds the server image from this tree and starts it
+```
 
 ```bash
 make down     # stop
@@ -67,12 +146,12 @@ make web-build
 Create the agent under **Hosts & agents → Add a host → Run one command on the machine**, or run:
 
 ```bash
-docker run --rm \
+docker run -d --name kairos-agent --restart unless-stopped \
   -e KAIROS_SERVER_URL=http://kairos:8080 \
   -e KAIROS_AGENT_TOKEN=<token> \
   -e KAIROS_AGENT_NAME=worker-1 \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  kairos-agent:latest
+  ghcr.io/zypher-systems/kairos-agent:latest
 ```
 
 Compose profile `dev` includes an `agent` service. For real hosts, use **push-install** from the host's edit dialog, or run the server-hosted installer: `curl -fsSL http://kairos:8080/api/v1/agent/install.sh | sh -s -- --server http://kairos:8080 --token <token>` — it writes a systemd unit (amd64/arm64).
