@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Kairos API",
-    "version": "1.18.0",
+    "version": "1.18.1",
     "description": "Kairos job orchestrator REST API."
   },
   "servers": [
