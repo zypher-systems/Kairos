@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -25,8 +27,8 @@ type fileWatch struct {
 	glob     string
 	root     string
 	interval time.Duration
-	lastSent string // last signature we reported (or baselined)
-	settle   string // candidate signature seen once, awaiting confirmation
+	lastSent string // last signature the server accepted (or baselined)
+	settle   string // candidate signature seen once, awaiting confirmation or delivery
 	armed    bool   // baseline taken — first sighting reports nothing
 }
 
@@ -100,15 +102,18 @@ func (w *Watcher) loop(ctx context.Context, fw *fileWatch) {
 }
 
 // poll computes the current signature and reports it once it has been
-// stable across two consecutive polls (settle window).
+// stable across two consecutive polls (settle window). A report that did
+// not reach the server stays pending and goes out again on the next poll;
+// the server drops a repeat of a signature it already fired. Only a definite
+// refusal drops a report. Polls are at least ten seconds apart, which is
+// backoff enough. Only this goroutine touches fw's state, so the network
+// call holds no lock.
 func (w *Watcher) poll(ctx context.Context, fw *fileWatch) {
 	sig, files, err := globSignature(fw.root, fw.glob)
 	if err != nil {
 		slog.Debug("watch poll", "job", fw.jobID, "glob", fw.glob, "err", err)
 		return
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
 	if !fw.armed {
 		// Baseline: pre-existing files never fire.
 		fw.lastSent = sig
@@ -123,14 +128,35 @@ func (w *Watcher) poll(ctx context.Context, fw *fileWatch) {
 		fw.settle = sig
 		return
 	}
-	// Stable change across two polls: report once.
-	fw.settle = ""
-	fw.lastSent = sig
-	if err := w.client.ReportWatch(ctx, fw.jobID, sig, files); err != nil {
+	// Stable change across two polls: report it.
+	err = w.client.ReportWatch(ctx, fw.jobID, sig, files)
+	if err != nil && !refusedForGood(err) {
 		slog.Warn("watch report", "job", fw.jobID, "err", err)
 		return
 	}
+	fw.settle = ""
+	fw.lastSent = sig
+	if err != nil {
+		slog.Warn("watch report refused", "job", fw.jobID, "err", err)
+		return
+	}
 	slog.Info("watch fired", "job", fw.jobID, "glob", fw.glob)
+}
+
+// refusedForGood reports an answer that will not change on a retry: the job
+// is gone or the watch is no longer this agent's. StatusError.Permanent is
+// too broad here. A proxy's 408, a 429 or a 401 can pass, and losing an
+// arrival costs more than repeating a report.
+func refusedForGood(err error) bool {
+	var se *StatusError
+	if !errors.As(err, &se) {
+		return false
+	}
+	switch se.Code {
+	case http.StatusBadRequest, http.StatusForbidden, http.StatusNotFound, http.StatusGone:
+		return true
+	}
+	return false
 }
 
 // globSignature hashes the sorted matched-file set (name+size+mtime) and
@@ -141,6 +167,7 @@ func globSignature(root, pattern string) (string, []string, error) {
 	if err != nil {
 		return "", nil, err
 	}
+	defer b.Close()
 	entries, err := b.List(context.Background(), pattern)
 	if err != nil {
 		return "", nil, err

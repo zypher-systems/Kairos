@@ -7,7 +7,7 @@ RUN npm run build
 
 FROM golang:1.26-alpine AS build
 WORKDIR /src
-ARG VERSION=1.18.0
+ARG VERSION=1.18.1
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .

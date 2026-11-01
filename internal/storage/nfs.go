@@ -10,6 +10,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/willscott/go-nfs-client/nfs"
@@ -22,6 +23,8 @@ import (
 // GID), so exports must allow it (or map it with all_squash/anonuid).
 type NFS struct {
 	root   string
+	server string
+	export string
 	mount  *nfs.Mount
 	target *nfs.Target
 }
@@ -39,24 +42,21 @@ func OpenNFS(ctx context.Context, s Spec) (*NFS, error) {
 		b   *NFS
 		err error
 	}
-	done := make(chan result, 1)
-	go func() {
+	connect := func() (*NFS, error) {
 		var m *nfs.Mount
 		if s.Port != 0 {
 			// A fixed port serves both MOUNT and NFS (appliances and
 			// userspace servers that run without a portmapper).
 			client, err := rpc.DialTCP("tcp", net.JoinHostPort(host, fmt.Sprint(s.Port)), false)
 			if err != nil {
-				done <- result{nil, fmt.Errorf("nfs dial %s:%d: %w", host, s.Port, err)}
-				return
+				return nil, fmt.Errorf("nfs dial %s:%d: %w", host, s.Port, err)
 			}
 			m = &nfs.Mount{Client: client}
 		} else {
 			var err error
 			m, err = nfs.DialMount(host, 0)
 			if err != nil {
-				done <- result{nil, fmt.Errorf("nfs dial %s (portmapper): %w", host, err)}
-				return
+				return nil, fmt.Errorf("nfs dial %s (portmapper): %w", host, err)
 			}
 		}
 		auth := rpc.NewAuthUnix("kairos", s.UID, s.GID)
@@ -67,10 +67,28 @@ func OpenNFS(ctx context.Context, s Spec) (*NFS, error) {
 		t, err := m.Mount(export, auth.Auth())
 		if err != nil {
 			m.Close()
-			done <- result{nil, fmt.Errorf("nfs mount %s:%s: %w", host, s.Export, err)}
-			return
+			return nil, fmt.Errorf("nfs mount %s:%s: %w", host, s.Export, err)
 		}
-		done <- result{&NFS{root: strings.Trim(strings.TrimSpace(s.Root), "/"), mount: m, target: t}, nil}
+		return &NFS{
+			root:   strings.Trim(strings.TrimSpace(s.Root), "/"),
+			server: host,
+			export: export,
+			mount:  m,
+			target: t,
+		}, nil
+	}
+	done := make(chan result, 1)
+	go func() {
+		// The client binds a random source port and retries a taken one
+		// only in privileged mode, which this is not.
+		var b *NFS
+		var err error
+		for range 8 {
+			if b, err = connect(); !errors.Is(err, syscall.EADDRINUSE) {
+				break
+			}
+		}
+		done <- result{b, err}
 	}()
 	select {
 	case r := <-done:
@@ -94,6 +112,14 @@ func (b *NFS) abs(p string) (string, error) {
 		return rel, nil
 	}
 	return b.root + "/" + rel, nil
+}
+
+func (b *NFS) identity(p string) (string, error) {
+	abs, err := b.abs(p)
+	if err != nil {
+		return "", err
+	}
+	return "nfs://" + strings.ToLower(b.server) + strings.TrimRight(b.export, "/") + "/" + abs, nil
 }
 
 func (b *NFS) rel(abs string) string {
@@ -198,8 +224,7 @@ func (b *NFS) Create(ctx context.Context, p string, overwrite bool) (Writer, err
 	if err := b.mkdirAll(path.Dir(abs)); err != nil {
 		return nil, err
 	}
-	tmp := abs + ".kairos-part"
-	_ = b.target.Remove(tmp)
+	tmp := partName(abs)
 	if _, err := b.target.Create(tmp, 0o644); err != nil {
 		return nil, fmt.Errorf("create %s: %w", p, err)
 	}
@@ -208,15 +233,16 @@ func (b *NFS) Create(ctx context.Context, p string, overwrite bool) (Writer, err
 		_ = b.target.Remove(tmp)
 		return nil, fmt.Errorf("open %s for writing: %w", p, err)
 	}
-	return &nfsWriter{b: b, f: f, tmp: tmp, final: abs}, nil
+	return &nfsWriter{b: b, f: f, tmp: tmp, final: abs, overwrite: overwrite}, nil
 }
 
 type nfsWriter struct {
-	b     *NFS
-	f     *nfs.File
-	tmp   string
-	final string
-	done  bool
+	b         *NFS
+	f         *nfs.File
+	tmp       string
+	final     string
+	overwrite bool
+	done      bool
 }
 
 func (w *nfsWriter) Write(p []byte) (int, error) { return w.f.Write(p) }
@@ -235,12 +261,93 @@ func (w *nfsWriter) Commit(modTime time.Time) error {
 			Mtime: nfs.SetTime{SetIt: nfs.SetToClientTime, Time: nfs.NFS3Time{Seconds: uint32(modTime.Unix()), Nseconds: uint32(modTime.Nanosecond())}},
 		})
 	}
-	// NFS rename replaces an existing target atomically.
+	if !w.overwrite {
+		if err := w.claim(); err != nil {
+			return err
+		}
+	}
+	// NFS rename replaces an existing target atomically. NFSv3 has no
+	// exclusive rename, so with overwrite off a file landing between the
+	// claim's check and this request would still be replaced.
 	if err := w.b.target.Rename(w.tmp, w.final); err != nil {
+		if !w.overwrite {
+			// Removing the link is not safe, even after checking it: a file
+			// can land between the check and the unlink. The link stays,
+			// and the temporary file with it, since the link needs it.
+			return fmt.Errorf("rename into place: %w (its link at the destination and temporary file remain)", err)
+		}
 		w.b.target.Remove(w.tmp)
 		return fmt.Errorf("rename into place: %w", err)
 	}
 	return nil
+}
+
+// nameHolder says who holds the final name.
+type nameHolder int
+
+const (
+	heldByNobody nameHolder = iota
+	heldByThisWriter
+	heldByAnother
+	heldByUnknown
+)
+
+// holder reads the final name. It is this writer's only as a link to its own
+// temporary file. A read that fails answers nothing, so it is heldByUnknown
+// and not a guess in either direction.
+func (w *nfsWriter) holder() nameHolder {
+	fi, _, err := w.b.target.Lookup(w.final)
+	if nfsNotExist(err) {
+		return heldByNobody
+	}
+	if err != nil {
+		return heldByUnknown
+	}
+	if attr, ok := fi.(*nfs.Fattr); !ok || attr.Type != nfs.NF3Lnk {
+		return heldByAnother
+	}
+	f, err := w.b.target.Open(w.final)
+	if err != nil {
+		return heldByUnknown
+	}
+	target, err := f.Readlink()
+	if err != nil {
+		return heldByUnknown
+	}
+	if target == path.Base(w.tmp) {
+		return heldByThisWriter
+	}
+	return heldByAnother
+}
+
+// claim takes the final name for overwrite off, because the rename would
+// replace whatever is there. The client has no exclusive create, but
+// SYMLINK is atomic and fails on an existing name, and this link points at
+// the finished temporary file, so a reader sees the whole file from here
+// on.
+//
+// What SYMLINK answered does not decide the outcome. The client resends a
+// request with no reply, and SYMLINK is not idempotent, so "exists" can be
+// this writer's own link. The name is read back instead. If that cannot say
+// who holds it, the link and the temporary file both stay: removing either
+// could strand a link to nothing or take someone else's file.
+func (w *nfsWriter) claim() error {
+	err := w.b.target.Symlink(path.Base(w.tmp), w.final)
+	switch w.holder() {
+	case heldByThisWriter:
+		return nil
+	case heldByUnknown:
+		return fmt.Errorf("could not confirm the claim on %s (its link at the destination and temporary file may remain)", w.final)
+	case heldByAnother:
+		w.b.target.Remove(w.tmp)
+		return ErrExists
+	}
+	// Nobody holds the name, so the export refused the link.
+	w.b.target.Remove(w.tmp)
+	if err == nil {
+		err = errors.New("the link disappeared")
+	}
+	return fmt.Errorf("%w: %v", errCannotLand, err)
 }
 
 func (w *nfsWriter) Abort() error {
