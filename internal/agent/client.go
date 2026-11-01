@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -187,40 +186,6 @@ func (c *Client) ReportWatch(ctx context.Context, jobID uuid.UUID, sig string, f
 		return statusErr("watch-event", resp)
 	}
 	return nil
-}
-
-// DownloadLibraryFile streams a library file to disk (push direction).
-func (c *Client) DownloadLibraryFile(ctx context.Context, fileID, destPath string, overwrite bool) error {
-	resp, err := c.do(ctx, "GET", "/api/v1/agent/files/"+fileID+"/content", nil)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return statusErr("download", resp)
-	}
-	if !overwrite {
-		if _, err := os.Stat(destPath); err == nil {
-			return fmt.Errorf("destination %s exists and overwrite is off", destPath)
-		}
-	}
-	if dir := filepath.Dir(destPath); dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
-		}
-	}
-	tmp := destPath + ".kairos-part"
-	fh, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	_, copyErr := io.Copy(fh, resp.Body)
-	closeErr := fh.Close()
-	if copyErr != nil || closeErr != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("write: copy=%v close=%v", copyErr, closeErr)
-	}
-	return os.Rename(tmp, destPath)
 }
 
 // UploadFile streams a local file to the server library (pull direction).

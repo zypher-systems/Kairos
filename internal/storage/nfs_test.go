@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -64,5 +65,91 @@ func TestNFSBackendRoundTrip(t *testing.T) {
 	}
 	if _, err := b.Stat(context.Background(), "../etc/passwd"); err == nil || !strings.Contains(err.Error(), "escapes") {
 		t.Fatalf("escape must be refused: %v", err)
+	}
+}
+
+func openTestNFS(t *testing.T, dir string) *NFS {
+	t.Helper()
+	host, portStr, _ := net.SplitHostPort(startNFSServer(t, dir))
+	port, _ := strconv.Atoi(portStr)
+	b, err := OpenNFS(context.Background(), Spec{Kind: KindNFS, Host: host, Port: port, Export: "/", UID: 1000, GID: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	return b
+}
+
+func TestNFSOverwriteOffHoldsAtCommit(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	b := openTestNFS(t, dir)
+	w, err := b.Create(ctx, "out.csv", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("late")); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(dir, "out.csv"), "first")
+	if err := w.Commit(zeroTime); !errors.Is(err, ErrExists) {
+		t.Fatalf("commit over a new file must fail with ErrExists: %v", err)
+	}
+	if got := read(t, filepath.Join(dir, "out.csv")); got != "first" {
+		t.Fatalf("destination replaced with overwrite off: %q", got)
+	}
+
+	// With nothing in the way the file lands as a regular file.
+	w, err = b.Create(ctx, "fresh.csv", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(zeroTime); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Lstat(filepath.Join(dir, "fresh.csv"))
+	if err != nil || !st.Mode().IsRegular() {
+		t.Fatalf("landed %v %v", st, err)
+	}
+	if got := read(t, filepath.Join(dir, "fresh.csv")); got != "new" {
+		t.Fatalf("landed %q", got)
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, "*.kairos-part")); len(left) != 0 {
+		t.Fatalf("temp files left behind: %v", left)
+	}
+}
+
+func TestNFSConcurrentWritersKeepTheirOwnBytes(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	b := openTestNFS(t, dir)
+	first, err := b.Create(ctx, "out.csv", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := b.Create(ctx, "out.csv", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Write([]byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Write([]byte("second")); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Commit(zeroTime); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, filepath.Join(dir, "out.csv")); got != "first" {
+		t.Fatalf("first commit landed %q", got)
+	}
+	if err := second.Commit(zeroTime); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, filepath.Join(dir, "out.csv")); got != "second" {
+		t.Fatalf("second commit landed %q", got)
 	}
 }

@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -19,9 +20,13 @@ import (
 // Objects are written with a single PutObject, which is atomic: a reader
 // never sees a partial object, so no temporary name is needed.
 type S3 struct {
-	root   string
-	bucket string
-	client *minio.Client
+	root     string
+	bucket   string
+	endpoint string
+	client   *minio.Client
+	// partSize overrides the upload part size; zero sizes parts for the
+	// largest object S3 allows.
+	partSize int64
 }
 
 // OpenS3 builds the client for a spec. Endpoint empty means AWS in Region.
@@ -63,7 +68,7 @@ func OpenS3(ctx context.Context, s Spec) (*S3, error) {
 	if err != nil {
 		return nil, fmt.Errorf("s3 client: %w", err)
 	}
-	return &S3{root: strings.Trim(strings.TrimSpace(s.Root), "/"), bucket: s.Bucket, client: client}, nil
+	return &S3{root: strings.Trim(strings.TrimSpace(s.Root), "/"), bucket: s.Bucket, endpoint: endpoint, client: client}, nil
 }
 
 func (b *S3) Kind() Kind { return KindS3 }
@@ -79,6 +84,14 @@ func (b *S3) key(p string) (string, error) {
 		return rel, nil
 	}
 	return b.root + "/" + rel, nil
+}
+
+func (b *S3) identity(p string) (string, error) {
+	key, err := b.key(p)
+	if err != nil {
+		return "", err
+	}
+	return "s3://" + b.endpoint + "/" + b.bucket + "/" + key, nil
 }
 
 func (b *S3) rel(key string) string {
@@ -165,7 +178,12 @@ func (b *S3) Create(ctx context.Context, p string, overwrite bool) (Writer, erro
 	pr, pw := io.Pipe()
 	w := &s3Writer{pw: pw, done: make(chan error, 1)}
 	go func() {
-		_, err := b.client.PutObject(ctx, b.bucket, key, pr, -1, minio.PutObjectOptions{})
+		var err error
+		if overwrite {
+			_, err = b.client.PutObject(ctx, b.bucket, key, pr, -1, minio.PutObjectOptions{})
+		} else {
+			err = b.putIfAbsent(ctx, key, pr)
+		}
 		if err != nil {
 			pr.CloseWithError(err)
 		} else {
@@ -174,6 +192,82 @@ func (b *S3) Create(ctx context.Context, p string, overwrite bool) (Writer, erro
 		w.done <- err
 	}()
 	return w, nil
+}
+
+// putIfAbsent uploads r to key unless the key exists by the time the upload
+// finishes. The check in Create cannot promise that: a whole file passes
+// between it and the commit. The request that makes the object visible
+// carries If-None-Match, which PutObject cannot do: it drops custom headers
+// from the request that completes a streaming upload.
+func (b *S3) putIfAbsent(ctx context.Context, key string, r io.Reader) error {
+	core := minio.Core{Client: b.client}
+	partSize := b.partSize
+	if partSize == 0 {
+		var err error
+		if _, partSize, _, err = minio.OptimalPartInfo(-1, 0); err != nil {
+			return err
+		}
+	}
+	buf := make([]byte, partSize)
+	n, err := io.ReadFull(r, buf)
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return ifAbsent(func(opts minio.PutObjectOptions) error {
+			_, err := core.PutObject(ctx, b.bucket, key, bytes.NewReader(buf[:n]), int64(n), "", "", opts)
+			return err
+		})
+	}
+	if err != nil {
+		return err
+	}
+
+	id, err := core.NewMultipartUpload(ctx, b.bucket, key, minio.PutObjectOptions{})
+	if err != nil {
+		return err
+	}
+	completed := false
+	defer func() {
+		if !completed {
+			_ = core.AbortMultipartUpload(context.WithoutCancel(ctx), b.bucket, key, id)
+		}
+	}()
+	var parts []minio.CompletePart
+	for num := 1; ; num++ {
+		part, err := core.PutObjectPart(ctx, b.bucket, key, id, num, bytes.NewReader(buf[:n]), int64(n), minio.PutObjectPartOptions{})
+		if err != nil {
+			return err
+		}
+		parts = append(parts, minio.CompletePart{PartNumber: num, ETag: part.ETag})
+		n, err = io.ReadFull(r, buf)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
+			return err
+		}
+	}
+	err = ifAbsent(func(opts minio.PutObjectOptions) error {
+		_, err := core.CompleteMultipartUpload(ctx, b.bucket, key, id, parts, opts)
+		return err
+	})
+	completed = err == nil
+	return err
+}
+
+// ifAbsent runs the write that makes an object visible, on condition that
+// the key is free. A store without conditional writes is asked again
+// without the condition: for it, the check in Create is all there is, and
+// refusing the transfer would be worse.
+func ifAbsent(write func(minio.PutObjectOptions) error) error {
+	var opts minio.PutObjectOptions
+	opts.SetMatchETagExcept("*")
+	err := write(opts)
+	switch minio.ToErrorResponse(err).Code {
+	case "PreconditionFailed":
+		return ErrExists
+	case "NotImplemented":
+		return write(minio.PutObjectOptions{})
+	}
+	return err
 }
 
 type s3Writer struct {

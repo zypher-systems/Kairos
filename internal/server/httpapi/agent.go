@@ -435,6 +435,12 @@ func buildAgentTransferSpec(ctx context.Context, st *store.Store, job store.Job,
 			}
 			return side, nil
 		}
+		// Saving such a route is refused, but a job from before that rule
+		// can still reach here. Fail it rather than send the agent a path
+		// that names something else on its own disk.
+		if r.ServerOnly() {
+			return protocol.TransferSide{}, fmt.Errorf("%s is on the server and an agent cannot reach it", r.Name)
+		}
 		spec := r.Spec
 		return protocol.TransferSide{Storage: &spec, Path: r.Path, Name: r.Name}, nil
 	}

@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/zypher-systems/kairos/internal/server/store"
@@ -80,8 +81,8 @@ func TestTransferTargetDerivedFromEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mount := &store.StorageLocation{Name: "nfs", Kind: "mount", BasePath: "/mnt/in"}
-	if err := st.CreateStorageLocation(ctx, mount); err != nil {
+	bucket := &store.StorageLocation{Name: "lake", Kind: "s3", Bucket: "in", Region: "eu-west-1"}
+	if err := st.CreateStorageLocation(ctx, bucket); err != nil {
 		t.Fatal(err)
 	}
 	onAgent := &store.StorageLocation{Name: "edge-disk", Kind: "agent", AgentID: &ag.ID, BasePath: "/data"}
@@ -92,7 +93,7 @@ func TestTransferTargetDerivedFromEndpoints(t *testing.T) {
 	j.ExecMode = "transfer"
 	j.TargetType = "ssh" // wrong on purpose: the store derives the target
 	j.TransferConfig = store.TransferConfig{
-		Source: store.TransferEndpoint{Kind: "location", LocationID: &mount.ID, Path: "*.csv"},
+		Source: store.TransferEndpoint{Kind: "location", LocationID: &bucket.ID, Path: "*.csv"},
 		Dest:   store.TransferEndpoint{Kind: "location", LocationID: &onAgent.ID, Path: "archive/"},
 	}
 	job, err := st.CreateJob(ctx, j, nil)
@@ -116,11 +117,82 @@ func TestTransferTargetDerivedFromEndpoints(t *testing.T) {
 		t.Fatal(err)
 	}
 	if updated.TargetType != "local" {
-		t.Fatalf("mount -> library runs on the server, got %s", updated.TargetType)
+		t.Fatalf("s3 -> library runs on the server, got %s", updated.TargetType)
 	}
 	// from_trigger needs the trigger.
 	job.TransferConfig.FromTrigger = true
 	if _, err := st.UpdateJob(ctx, &job); err == nil {
 		t.Fatal("from_trigger without a file trigger must be refused")
+	}
+}
+
+// A directory on the server cannot be half of a transfer that runs on an
+// agent: the agent would open that path on its own disk.
+func TestTransferRefusesServerDirectoryOnAnAgentRoute(t *testing.T) {
+	st := testutil.Store(t)
+	ctx := context.Background()
+	ag, _, err := st.CreateAgent(ctx, "edge", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mount := &store.StorageLocation{Name: "server-share", Kind: "mount", BasePath: "/mnt/in"}
+	onAgent := &store.StorageLocation{Name: "edge-disk", Kind: "agent", AgentID: &ag.ID, BasePath: "/data"}
+	for _, l := range []*store.StorageLocation{mount, onAgent} {
+		if err := st.CreateStorageLocation(ctx, l); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mountEnd := store.TransferEndpoint{Kind: "location", LocationID: &mount.ID, Path: "in/"}
+	agentEnd := store.TransferEndpoint{Kind: "location", LocationID: &onAgent.ID, Path: "in/"}
+	legacyAgentEnd := store.TransferEndpoint{Kind: "agent", AgentID: &ag.ID, Path: "/data/in/"}
+	library := store.TransferEndpoint{Kind: "library", Path: "out.csv"}
+
+	transfer := func(cfg store.TransferConfig) *store.Job {
+		j := localJob("move")
+		j.ExecMode = "transfer"
+		j.TransferConfig = cfg
+		return j
+	}
+	refused := map[string]*store.Job{
+		"mount to agent":        transfer(store.TransferConfig{Source: mountEnd, Dest: agentEnd}),
+		"agent to mount":        transfer(store.TransferConfig{Source: agentEnd, Dest: mountEnd}),
+		"mount to legacy agent": transfer(store.TransferConfig{Source: mountEnd, Dest: legacyAgentEnd}),
+	}
+	watched := transfer(store.TransferConfig{Source: agentEnd, Dest: mountEnd, FromTrigger: true})
+	watched.WatchEnabled, watched.WatchTarget, watched.WatchLocationID = true, "location", &onAgent.ID
+	watched.WatchPath, watched.WatchIntervalSec = "*.csv", 10
+	refused["agent trigger to mount"] = watched
+	watchServer := transfer(store.TransferConfig{Source: agentEnd, Dest: agentEnd, FromTrigger: true})
+	watchServer.WatchEnabled, watchServer.WatchTarget = true, "local"
+	watchServer.WatchPath, watchServer.WatchIntervalSec = "/mnt/in/*.csv", 10
+	refused["server filesystem trigger to agent"] = watchServer
+	for name, j := range refused {
+		t.Run(name, func(t *testing.T) {
+			_, err := st.CreateJob(ctx, j, nil)
+			if err == nil || !strings.Contains(err.Error(), "on the server") {
+				t.Fatalf("must be refused with the reason, got %v", err)
+			}
+		})
+	}
+
+	// The same locations stay usable on routes that can reach them.
+	for name, cfg := range map[string]store.TransferConfig{
+		"mount to library": {Source: mountEnd, Dest: library},
+		"library to agent": {Source: library, Dest: agentEnd},
+	} {
+		t.Run(name, func(t *testing.T) {
+			j := transfer(cfg)
+			if cfg.Source.Kind == "library" {
+				f := store.FileEntry{Name: "a.csv", StoragePath: "files/a"}
+				if err := st.CreateFile(ctx, &f); err != nil {
+					t.Fatal(err)
+				}
+				j.TransferConfig.Source.FileID = &f.ID
+			}
+			j.Name = name
+			if _, err := st.CreateJob(ctx, j, nil); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
