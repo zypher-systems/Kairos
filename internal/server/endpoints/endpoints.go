@@ -1,6 +1,5 @@
 // Package endpoints turns the places a job refers to (storage locations,
-// SSH hosts, agents, the library) into storage specs a worker can open,
-// and decides which worker runs a transfer.
+// SSH hosts, agents, the library) into storage specs a worker can open.
 package endpoints
 
 import (
@@ -28,6 +27,12 @@ type Resolved struct {
 	Name string
 	// SSHHostID is set for SFTP sides so a learned host key can be pinned.
 	SSHHostID *uuid.UUID
+}
+
+// ServerOnly reports a directory on the Kairos server: a mount location or
+// the server filesystem. Its spec means nothing on any other machine.
+func (r Resolved) ServerOnly() bool {
+	return !r.Library && r.AgentID == nil && r.Spec.Kind == storage.KindLocal
 }
 
 // Resolve builds the storage spec for an endpoint. Secrets are revealed;
@@ -135,39 +140,6 @@ func sftpSpec(ctx context.Context, st *store.Store, hostID uuid.UUID, root strin
 		PrivateKeyPEM: key, Password: password,
 		HostKeyFingerprint: fp, VerifyHostKey: host.VerifyHostKey,
 	}, host.Name, nil
-}
-
-// TransferAgent returns the agent that must execute a transfer, or nil
-// when the server does. A transfer with an agent on either side runs on
-// that agent; two different agents cannot be combined.
-func TransferAgent(ctx context.Context, st *store.Store, c store.TransferConfig) (*uuid.UUID, error) {
-	var agent *uuid.UUID
-	for _, e := range []store.TransferEndpoint{c.Source, c.Dest} {
-		var id *uuid.UUID
-		switch e.Kind {
-		case "agent":
-			id = e.AgentID
-		case "location":
-			if e.LocationID == nil {
-				continue
-			}
-			loc, err := st.GetStorageLocation(ctx, *e.LocationID)
-			if err != nil {
-				return nil, fmt.Errorf("storage location %s not found", e.LocationID)
-			}
-			if loc.Kind == "agent" {
-				id = loc.AgentID
-			}
-		}
-		if id == nil {
-			continue
-		}
-		if agent != nil && *agent != *id {
-			return nil, errors.New("a transfer cannot span two different agents")
-		}
-		agent = id
-	}
-	return agent, nil
 }
 
 // WatchSide resolves what a job's file trigger watches, so a
