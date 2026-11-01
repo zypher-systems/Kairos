@@ -215,6 +215,11 @@ type raceFS struct {
 	billy.Filesystem
 	afterSymlink func()
 	failRename   func()
+	// lostReply makes SYMLINK work and answer with a failure, which is what
+	// the client sees when its resend reaches a server that already did it.
+	lostReply    bool
+	failReadlink bool
+	removed      []string
 }
 
 func (f *raceFS) Symlink(target, link string) error {
@@ -222,7 +227,22 @@ func (f *raceFS) Symlink(target, link string) error {
 	if f.afterSymlink != nil {
 		f.afterSymlink()
 	}
+	if err == nil && f.lostReply {
+		return os.ErrExist
+	}
 	return err
+}
+
+func (f *raceFS) Readlink(link string) (string, error) {
+	if f.failReadlink {
+		return "", syscall.EIO
+	}
+	return f.Filesystem.Readlink(link)
+}
+
+func (f *raceFS) Remove(name string) error {
+	f.removed = append(f.removed, name)
+	return f.Filesystem.Remove(name)
 }
 
 func (f *raceFS) Rename(from, to string) error {
@@ -282,13 +302,90 @@ func TestNFSOverwriteOffChecksItsClaimBeforeRenaming(t *testing.T) {
 	}
 }
 
-// A failed rename may clear this writer's own claim and nothing else.
-func TestNFSFailedRenameClearsOnlyItsOwnClaim(t *testing.T) {
+// A resent SYMLINK can answer "exists" for a link this writer made. The name
+// is already held, so the transfer carries on.
+func TestNFSKeepsAClaimItAlreadyHolds(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	b := openNFSOn(t, &raceFS{Filesystem: osfs.New(dir), lostReply: true})
+	w, err := b.Create(ctx, "out.csv", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(zeroTime); err != nil {
+		t.Fatalf("the claim was this writer's: %v", err)
+	}
+	st, err := os.Lstat(filepath.Join(dir, "out.csv"))
+	if err != nil || !st.Mode().IsRegular() {
+		t.Fatalf("landed %v %v", st, err)
+	}
+	if got := read(t, filepath.Join(dir, "out.csv")); got != "data" {
+		t.Fatalf("landed %q", got)
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, "*.kairos-part")); len(left) != 0 {
+		t.Fatalf("temp files left behind: %v", left)
+	}
+}
+
+// Another writer's claim is a refusal, and this writer's file goes.
+func TestNFSAnotherWritersClaimIsARefusal(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	b := openNFSOn(t, &raceFS{Filesystem: osfs.New(dir)})
+	w, err := b.Create(ctx, "out.csv", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(dir, "elsewhere.kairos-part"), "their data")
+	if err := os.Symlink("elsewhere.kairos-part", filepath.Join(dir, "out.csv")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(zeroTime); !errors.Is(err, ErrExists) {
+		t.Fatalf("got %v", err)
+	}
+	if got := read(t, filepath.Join(dir, "out.csv")); got != "their data" {
+		t.Fatalf("landed %q", got)
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, "*.kairos-part")); len(left) != 1 {
+		t.Fatalf("only the other writer's temp file may stay: %v", left)
+	}
+}
+
+// When the link cannot be read, whose it is stays open. Deleting the
+// temporary file would strand a link to nothing, and removing the link could
+// remove someone else's file, so both stay and the commit fails.
+func TestNFSUnreadableClaimLeavesEverything(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	b := openNFSOn(t, &raceFS{Filesystem: osfs.New(dir), failReadlink: true})
+	w, err := b.Create(ctx, "out.csv", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	err = w.Commit(zeroTime)
+	if err == nil || errors.Is(err, ErrExists) {
+		t.Fatalf("the name is not known to be taken, and not known to be free: %v", err)
+	}
+	if got := read(t, filepath.Join(dir, "out.csv")); got != "data" {
+		t.Fatalf("the link must still reach the whole file, got %q", got)
+	}
+}
+
+// After a failed rename the final name is left alone. Checking it first
+// would not help: a file can land between that check and the unlink.
+func TestNFSFailedRenameLeavesTheFinalName(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("another file took the name", func(t *testing.T) {
 		dir := t.TempDir()
-		b := openNFSOn(t, &raceFS{Filesystem: osfs.New(dir), failRename: replaceFinal(t, dir)})
+		fs := &raceFS{Filesystem: osfs.New(dir), failRename: replaceFinal(t, dir)}
+		b := openNFSOn(t, fs)
 		w, err := b.Create(ctx, "out.csv", false)
 		if err != nil {
 			t.Fatal(err)
@@ -303,16 +400,25 @@ func TestNFSFailedRenameClearsOnlyItsOwnClaim(t *testing.T) {
 
 	t.Run("the claim is still ours", func(t *testing.T) {
 		dir := t.TempDir()
-		b := openNFSOn(t, &raceFS{Filesystem: osfs.New(dir), failRename: func() {}})
+		fs := &raceFS{Filesystem: osfs.New(dir), failRename: func() {}}
+		b := openNFSOn(t, fs)
 		w, err := b.Create(ctx, "out.csv", false)
 		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte("data")); err != nil {
 			t.Fatal(err)
 		}
 		if err := w.Commit(zeroTime); err == nil {
 			t.Fatal("the rename failed; the commit must too")
 		}
-		if _, err := os.Lstat(filepath.Join(dir, "out.csv")); !os.IsNotExist(err) {
-			t.Fatalf("the claim must go: %v", err)
+		for _, name := range fs.removed {
+			if name == "out.csv" {
+				t.Fatal("the final name was unlinked")
+			}
+		}
+		if got := read(t, filepath.Join(dir, "out.csv")); got != "data" {
+			t.Fatalf("the link must still reach the whole file, got %q", got)
 		}
 	})
 }

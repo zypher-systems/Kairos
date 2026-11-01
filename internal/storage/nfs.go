@@ -263,20 +263,18 @@ func (w *nfsWriter) Commit(modTime time.Time) error {
 	}
 	if !w.overwrite {
 		if err := w.claim(); err != nil {
-			w.b.target.Remove(w.tmp)
 			return err
-		}
-		if !w.claimed() {
-			w.b.target.Remove(w.tmp)
-			return ErrExists
 		}
 	}
 	// NFS rename replaces an existing target atomically. NFSv3 has no
 	// exclusive rename, so with overwrite off a file landing between the
-	// check above and this request would still be replaced.
+	// claim's check and this request would still be replaced.
 	if err := w.b.target.Rename(w.tmp, w.final); err != nil {
-		if !w.overwrite && w.claimed() {
-			w.b.target.Remove(w.final)
+		if !w.overwrite {
+			// Removing the link is not safe, even after checking it: a file
+			// can land between the check and the unlink. The link stays,
+			// and the temporary file with it, since the link needs it.
+			return fmt.Errorf("rename into place: %w (its link at the destination and temporary file remain)", err)
 		}
 		w.b.target.Remove(w.tmp)
 		return fmt.Errorf("rename into place: %w", err)
@@ -284,30 +282,70 @@ func (w *nfsWriter) Commit(modTime time.Time) error {
 	return nil
 }
 
-// claimed reports whether the final name is still this writer's link to its
-// temporary file. Anything else there belongs to someone else.
-func (w *nfsWriter) claimed() bool {
+// nameHolder says who holds the final name.
+type nameHolder int
+
+const (
+	heldByNobody nameHolder = iota
+	heldByThisWriter
+	heldByAnother
+	heldByUnknown
+)
+
+// holder reads the final name. It is this writer's only as a link to its own
+// temporary file. A read that fails answers nothing, so it is heldByUnknown
+// and not a guess in either direction.
+func (w *nfsWriter) holder() nameHolder {
+	fi, _, err := w.b.target.Lookup(w.final)
+	if nfsNotExist(err) {
+		return heldByNobody
+	}
+	if err != nil {
+		return heldByUnknown
+	}
+	if attr, ok := fi.(*nfs.Fattr); !ok || attr.Type != nfs.NF3Lnk {
+		return heldByAnother
+	}
 	f, err := w.b.target.Open(w.final)
 	if err != nil {
-		return false
+		return heldByUnknown
 	}
 	target, err := f.Readlink()
-	return err == nil && target == path.Base(w.tmp)
+	if err != nil {
+		return heldByUnknown
+	}
+	if target == path.Base(w.tmp) {
+		return heldByThisWriter
+	}
+	return heldByAnother
 }
 
 // claim takes the final name for overwrite off, because the rename would
 // replace whatever is there. The client has no exclusive create, but
 // SYMLINK is atomic and fails on an existing name, and this link points at
 // the finished temporary file, so a reader sees the whole file from here
-// on. An export that refuses symlinks offers no way to take the name, so
-// the commit fails.
+// on.
+//
+// What SYMLINK answered does not decide the outcome. The client resends a
+// request with no reply, and SYMLINK is not idempotent, so "exists" can be
+// this writer's own link. The name is read back instead. If that cannot say
+// who holds it, the link and the temporary file both stay: removing either
+// could strand a link to nothing or take someone else's file.
 func (w *nfsWriter) claim() error {
 	err := w.b.target.Symlink(path.Base(w.tmp), w.final)
-	if err == nil {
+	switch w.holder() {
+	case heldByThisWriter:
 		return nil
-	}
-	if _, _, lerr := w.b.target.Lookup(w.final); lerr == nil {
+	case heldByUnknown:
+		return fmt.Errorf("could not confirm the claim on %s (its link at the destination and temporary file may remain)", w.final)
+	case heldByAnother:
+		w.b.target.Remove(w.tmp)
 		return ErrExists
+	}
+	// Nobody holds the name, so the export refused the link.
+	w.b.target.Remove(w.tmp)
+	if err == nil {
+		err = errors.New("the link disappeared")
 	}
 	return fmt.Errorf("%w: %v", errCannotLand, err)
 }
