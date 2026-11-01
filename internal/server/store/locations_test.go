@@ -175,6 +175,21 @@ func TestTransferRefusesServerDirectoryOnAnAgentRoute(t *testing.T) {
 		})
 	}
 
+	// A job without a trigger of its own reads what its workflow watches.
+	wf := &store.Workflow{Name: "watching-a-mount", WatchEnabled: true, WatchLocationID: &mount.ID, WatchPath: "*.csv", WatchIntervalSec: 10}
+	if err := st.CreateWorkflow(ctx, wf); err != nil {
+		t.Fatal(err)
+	}
+	inWorkflow := transfer(store.TransferConfig{Source: agentEnd, Dest: agentEnd, FromTrigger: true})
+	inWorkflow.TransferConfig.Dest.Path = "other/"
+	inWorkflow.WorkflowID = &wf.ID
+	t.Run("workflow trigger on a mount to agent", func(t *testing.T) {
+		_, err := st.CreateJob(ctx, inWorkflow, nil)
+		if err == nil || !strings.Contains(err.Error(), "on the server") {
+			t.Fatalf("must be refused with the reason, got %v", err)
+		}
+	})
+
 	// The same locations stay usable on routes that can reach them.
 	for name, cfg := range map[string]store.TransferConfig{
 		"mount to library": {Source: mountEnd, Dest: library},

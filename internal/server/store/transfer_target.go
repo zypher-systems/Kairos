@@ -62,13 +62,21 @@ func (s *Store) applyTransferTarget(ctx context.Context, j *Job) error {
 	// watch means the agent must run it.
 	if j.TransferConfig.FromTrigger {
 		if !j.WatchEnabled {
-			// The workflow's trigger counts when the job has none.
+			// The workflow's trigger counts when the job has none, and then
+			// the workflow's watched location is the source.
 			var wfWatch bool
+			var kind, name string
 			if j.WorkflowID != nil {
-				_ = s.pool.QueryRow(ctx, `SELECT watch_enabled FROM workflows WHERE id = $1`, *j.WorkflowID).Scan(&wfWatch)
+				_ = s.pool.QueryRow(ctx, `
+					SELECT w.watch_enabled, COALESCE(l.kind, ''), COALESCE(l.name, '')
+					FROM workflows w LEFT JOIN storage_locations l ON l.id = w.watch_location_id
+					WHERE w.id = $1`, *j.WorkflowID).Scan(&wfWatch, &kind, &name)
 			}
 			if !wfWatch {
 				return errors.New("\"use the files from the trigger\" needs a file trigger on the job or on its workflow")
+			}
+			if kind == "mount" {
+				onServer = name
 			}
 		}
 		var wid *uuid.UUID
