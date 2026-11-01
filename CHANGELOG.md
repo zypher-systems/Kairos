@@ -4,6 +4,15 @@
 
 Kairos is open source under the MIT License. Container images publish from GitHub Actions to `ghcr.io/zypher-systems/kairos` and `ghcr.io/zypher-systems/kairos-agent` for linux/amd64 and linux/arm64. The licensing server, license keys, trials, offline license files, and every feature gate are gone. Accounts, the audit log, YAML and git sync, SSO, retention, log search, SLA alerts, approval gates, Vault secret stores, skip calendars, and extra API replicas are included. A follower stays up and serves HTTP. `KAIROS_LICENSE_KEY`, `KAIROS_LICENSE_FILE`, and `KAIROS_LICENSE_SERVER` are ignored. Existing installs drop the `license_state` and `licenses` tables on the next migration.
 
+Fixed, in transfers and file triggers:
+
+- A move can no longer delete its only copy. With overwrite on, moving `a.csv` to `./` on its own location reported success and deleted the file, even with checksum verification on. A transfer whose source and destination are the same file now fails and leaves the file alone, including through a second location over the same directory, a symlink or a hard link.
+- Transfers to one destination no longer share a temporary file. Each writer has its own `*.kairos-part` name, on directories, SFTP, NFS and SMB. Before, one run could commit another run's bytes. A transfer killed part way through can leave its temporary file behind; it is safe to delete once no transfer is writing there.
+- **Overwrite** off now holds when the copy finishes, not only when it starts. A file that appears at the destination during a transfer is kept and the run fails, and a move keeps its source. SMB removed such a file to make room for its own. On S3 the final request carries `If-None-Match`; a store without conditional writes keeps only the check made before the copy.
+- Paths cannot leave a mounted or agent directory through a symlink, for reads, writes, deletes or listings. A relative link that stays inside the base path still works. **A link that leads outside the base path now fails, and so does any absolute link, even one that points inside it**; rewrite those as relative links. Parent references with backslashes are refused on every location; Samba honoured them and served files outside an SMB location's base path.
+- A mounted directory, or a file trigger on the server's filesystem, can no longer be an end of a transfer that runs on an agent. The agent opened that path on its own disk, which is not the directory the server has. **Such a job is now refused when saved, and an existing one fails its run with the reason**; use an agent directory, or a location the agent can connect to.
+- An agent keeps retrying a file-arrival event until the server accepts it. Before, one failed request lost the event until the files changed again.
+
 ## 1.18.0
 
 A new look: Dial.
