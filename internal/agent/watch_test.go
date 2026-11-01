@@ -113,3 +113,25 @@ func TestWatchRetryFollowsNewFiles(t *testing.T) {
 		t.Fatalf("report must carry both files, got %v", ev.Files)
 	}
 }
+
+// A 4xx will not change on a retry: the job is gone or the watch moved. The
+// report is dropped instead of being repeated on every poll.
+func TestWatchDropsAPermanentRefusal(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusForbidden, http.StatusBadRequest} {
+		srv := &fakeServer{statuses: []int{status}}
+		hs := httptest.NewServer(srv)
+		dir := t.TempDir()
+		w := NewWatcher(NewClient(hs.URL, "token", "test"))
+		fw := &fileWatch{jobID: uuid.New(), glob: "*.csv", root: dir, interval: time.Second}
+		w.poll(context.Background(), fw)
+		if err := settle(w, fw, dir, "a.csv"); err != nil {
+			t.Fatal(err)
+		}
+		w.poll(context.Background(), fw)
+		w.poll(context.Background(), fw)
+		hs.Close()
+		if got := srv.count(); got != 1 {
+			t.Fatalf("status %d: reported %d times", status, got)
+		}
+	}
+}
