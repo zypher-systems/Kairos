@@ -11,6 +11,7 @@ package storage
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -130,8 +131,10 @@ type Backend interface {
 	Stat(ctx context.Context, p string) (Entry, error)
 	Open(ctx context.Context, p string) (io.ReadCloser, Entry, error)
 	// Create prepares p for writing. With overwrite false an existing
-	// file is an error. Where the backend supports it the data lands in a
-	// temporary file and is renamed into place on Commit.
+	// file is an error, here and again at Commit, which returns ErrExists
+	// if a file took the name meanwhile. Where the backend supports it the
+	// data lands in a temporary file private to this writer and is renamed
+	// into place on Commit.
 	Create(ctx context.Context, p string, overwrite bool) (Writer, error)
 	Remove(ctx context.Context, p string) error
 	Close() error
@@ -158,6 +161,15 @@ func Open(ctx context.Context, s Spec) (Backend, error) {
 		return OpenSMB(ctx, s)
 	}
 	return nil, fmt.Errorf("unknown storage kind %q", s.Kind)
+}
+
+// partName is the temporary name a file is written under until Commit. It
+// is unique to the writer: two transfers to one destination must not share
+// a temporary file.
+func partName(final string) string {
+	var id [6]byte
+	_, _ = rand.Read(id[:])
+	return fmt.Sprintf("%s.%x.kairos-part", final, id)
 }
 
 // HasGlob reports whether p contains a wildcard.
@@ -189,7 +201,9 @@ func cleanRel(root, p string) (string, error) {
 		}
 		return path.Clean(p), nil
 	}
-	for _, seg := range strings.Split(p, "/") {
+	// A backslash separates path elements on SMB and Windows servers, so a
+	// parent reference is refused after either separator.
+	for _, seg := range strings.FieldsFunc(p, func(r rune) bool { return r == '/' || r == '\\' }) {
 		if seg == ".." {
 			return "", fmt.Errorf("path %q escapes the location", p)
 		}

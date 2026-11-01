@@ -21,6 +21,7 @@ import (
 // SFTP is a directory on an SSH host.
 type SFTP struct {
 	root   string
+	addr   string
 	conn   *ssh.Client
 	client *sftp.Client
 	// LearnedFingerprint is set when the host had no pinned key yet.
@@ -51,7 +52,7 @@ func OpenSFTP(ctx context.Context, s Spec) (*SFTP, error) {
 		conn.Close()
 		return nil, fmt.Errorf("sftp subsystem: %w", err)
 	}
-	b := &SFTP{root: strings.TrimSpace(s.Root), conn: conn, client: client}
+	b := &SFTP{root: strings.TrimSpace(s.Root), addr: fmt.Sprintf("%s:%d", s.Host, port), conn: conn, client: client}
 	if s.HostKeyFingerprint == "" && res.Fingerprint != "" {
 		b.LearnedFingerprint = res.Fingerprint
 	}
@@ -66,6 +67,20 @@ func (b *SFTP) abs(p string) (string, error) {
 		return "", err
 	}
 	return joinRoot(b.root, rel), nil
+}
+
+// identity asks the server for the real path, which sees through symlinks
+// and anchors a path relative to the login directory. The user is left out
+// on purpose: two accounts on one host reach the same files.
+func (b *SFTP) identity(p string) (string, error) {
+	abs, err := b.abs(p)
+	if err != nil {
+		return "", err
+	}
+	if real, err := b.client.RealPath(abs); err == nil {
+		abs = real
+	}
+	return "sftp://" + b.addr + "/" + strings.TrimPrefix(abs, "/"), nil
 }
 
 func (b *SFTP) rel(abs string) string {
@@ -148,8 +163,8 @@ func (b *SFTP) Create(ctx context.Context, p string, overwrite bool) (Writer, er
 	if err := b.mkdirAll(path.Dir(abs)); err != nil {
 		return nil, err
 	}
-	tmp := abs + ".kairos-part"
-	fh, err := b.client.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+	tmp := partName(abs)
+	fh, err := b.client.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
 	if err != nil {
 		return nil, fmt.Errorf("create %s: %w", tmp, err)
 	}
@@ -179,19 +194,51 @@ func (w *sftpWriter) Commit(modTime time.Time) error {
 	if !modTime.IsZero() {
 		_ = w.b.client.Chtimes(w.tmp, time.Now(), modTime)
 	}
-	if w.overwrite {
-		// Most SFTP servers refuse rename onto an existing file;
-		// posix-rename replaces atomically where supported.
-		if err := w.b.client.PosixRename(w.tmp, w.final); err == nil {
+	if !w.overwrite {
+		landed, err := w.claim()
+		if err != nil {
+			w.b.client.Remove(w.tmp)
+			return err
+		}
+		if landed {
 			return nil
 		}
-		_ = w.b.client.Remove(w.final)
 	}
+	// Most SFTP servers refuse rename onto an existing file; posix-rename
+	// replaces atomically where supported.
+	if err := w.b.client.PosixRename(w.tmp, w.final); err == nil {
+		return nil
+	}
+	_ = w.b.client.Remove(w.final)
 	if err := w.b.client.Rename(w.tmp, w.final); err != nil {
 		w.b.client.Remove(w.tmp)
 		return fmt.Errorf("rename %s into place: %w", w.tmp, err)
 	}
 	return nil
+}
+
+// claim takes the final name for overwrite off; a plain rename cannot be
+// trusted with that, since some servers let it replace. A hard link lands
+// the whole file at once and fails on an existing name. Without hard links
+// the name is created empty and exclusively for the rename to replace, and
+// landed is false.
+func (w *sftpWriter) claim() (landed bool, err error) {
+	c := w.b.client
+	if err := c.Link(w.tmp, w.final); err == nil {
+		_ = c.Remove(w.tmp)
+		return true, nil
+	}
+	if _, err := c.Lstat(w.final); err == nil {
+		return false, ErrExists
+	}
+	fh, err := c.OpenFile(w.final, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
+	if err != nil {
+		if _, serr := c.Lstat(w.final); serr == nil {
+			return false, ErrExists
+		}
+		return false, fmt.Errorf("claim %s: %w", w.final, err)
+	}
+	return false, fh.Close()
 }
 
 func (w *sftpWriter) Abort() error {

@@ -115,3 +115,45 @@ func TestTransferTriggerFilesIntoLibrary(t *testing.T) {
 		t.Fatalf("blob missing: %v", err)
 	}
 }
+
+// TestTransferMoveOntoItselfKeepsTheFile is the data-loss case: a move to
+// "./" on the same location lands on its own source. The run must fail and
+// the file must stay, with or without verification.
+func TestTransferMoveOntoItselfKeepsTheFile(t *testing.T) {
+	st := testutil.Store(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	file := filepath.Join(dir, "a.csv")
+	if err := os.WriteFile(file, []byte("only copy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	loc := &store.StorageLocation{Name: "data", Kind: "mount", BasePath: dir}
+	if err := st.CreateStorageLocation(ctx, loc); err != nil {
+		t.Fatal(err)
+	}
+	job := store.Job{
+		Name: "self-move", ExecMode: "transfer", TargetType: "local",
+		TransferConfig: store.TransferConfig{
+			Source:    store.TransferEndpoint{Kind: "location", LocationID: &loc.ID, Path: "a.csv"},
+			Dest:      store.TransferEndpoint{Kind: "location", LocationID: &loc.ID, Path: "./"},
+			Overwrite: true, DeleteSource: true, VerifyChecksum: true,
+		},
+	}
+	created, err := st.CreateJob(ctx, &job, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := st.EnqueueWithPolicy(ctx, created, store.TriggerManual, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := NewLogSink(ctx, st, run.ID, nil)
+	defer sink.Close()
+	code, msg := NewTransferRunner(st, t.TempDir()).Execute(ctx, created, run, sink)
+	if got, err := os.ReadFile(file); err != nil || string(got) != "only copy" {
+		t.Fatalf("the only copy is gone (exit %d, %q): %q %v", code, msg, got, err)
+	}
+	if code == 0 {
+		t.Fatal("moving a file onto itself must fail the run")
+	}
+}

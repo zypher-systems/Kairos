@@ -20,10 +20,12 @@ import (
 // spoken directly from the process with NTLMv2. No mount, no privileges,
 // so it runs on the server and on agents alike.
 type SMB struct {
-	root    string
-	conn    net.Conn
-	session *smb2.Session
-	share   *smb2.Share
+	root      string
+	server    string
+	shareName string
+	conn      net.Conn
+	session   *smb2.Session
+	share     *smb2.Share
 }
 
 // OpenSMB connects to the share in the spec: Host (host[:port], default
@@ -63,7 +65,7 @@ func OpenSMB(ctx context.Context, s Spec) (*SMB, error) {
 		return nil, fmt.Errorf("smb share %s: %w", s.Bucket, err)
 	}
 	root := strings.Trim(strings.ReplaceAll(strings.TrimSpace(s.Root), "\\", "/"), "/")
-	return &SMB{root: root, conn: conn, session: session, share: share}, nil
+	return &SMB{root: root, server: addr, shareName: s.Bucket, conn: conn, session: session, share: share}, nil
 }
 
 func (b *SMB) Kind() Kind { return KindSMB }
@@ -78,6 +80,16 @@ func (b *SMB) smbPath(p string) (string, error) {
 		rel = b.root + "/" + rel
 	}
 	return strings.ReplaceAll(rel, "/", "\\"), nil
+}
+
+// identity ignores case: SMB names are case-insensitive on Windows, and
+// refusing a false match costs less than deleting a real one.
+func (b *SMB) identity(p string) (string, error) {
+	sp, err := b.smbPath(p)
+	if err != nil {
+		return "", err
+	}
+	return strings.ToLower("smb://" + b.server + "/" + b.shareName + "/" + strings.ReplaceAll(sp, "\\", "/")), nil
 }
 
 func (b *SMB) rel(smbp string) string {
@@ -187,20 +199,21 @@ func (b *SMB) Create(ctx context.Context, p string, overwrite bool) (Writer, err
 	if dir := path.Dir(strings.ReplaceAll(sp, "\\", "/")); dir != "." && dir != "" {
 		_ = b.share.MkdirAll(strings.ReplaceAll(dir, "/", "\\"), 0o755)
 	}
-	tmp := sp + ".kairos-part"
-	f, err := b.share.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	tmp := partName(sp)
+	f, err := b.share.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("create %s: %w", p, err)
 	}
-	return &smbWriter{b: b, f: f, tmp: tmp, final: sp}, nil
+	return &smbWriter{b: b, f: f, tmp: tmp, final: sp, overwrite: overwrite}, nil
 }
 
 type smbWriter struct {
-	b     *SMB
-	f     *smb2.File
-	tmp   string
-	final string
-	done  bool
+	b         *SMB
+	f         *smb2.File
+	tmp       string
+	final     string
+	overwrite bool
+	done      bool
 }
 
 func (w *smbWriter) Write(p []byte) (int, error) { return w.f.Write(p) }
@@ -217,10 +230,18 @@ func (w *smbWriter) Commit(modTime time.Time) error {
 	if !modTime.IsZero() {
 		_ = w.b.share.Chtimes(w.tmp, time.Now(), modTime)
 	}
-	// SMB rename does not replace; clear the target first.
-	_ = w.b.share.Remove(w.final)
+	// SMB rename does not replace. With overwrite on the target is cleared
+	// first; with it off that refusal is the atomic check.
+	if w.overwrite {
+		_ = w.b.share.Remove(w.final)
+	}
 	if err := w.b.share.Rename(w.tmp, w.final); err != nil {
 		w.b.share.Remove(w.tmp)
+		if !w.overwrite {
+			if _, serr := w.b.share.Lstat(w.final); serr == nil {
+				return ErrExists
+			}
+		}
 		return fmt.Errorf("rename into place: %w", err)
 	}
 	return nil
