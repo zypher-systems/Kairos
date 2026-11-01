@@ -39,13 +39,11 @@ type identifier interface {
 // different kinds of backend are never compared: a directory mounted on
 // this machine and the NFS export behind it cannot be told apart from here.
 //
-// One name is not proof on a remote backend. Accounts chrooted on one SFTP
-// host report the same path for different files, and a case-sensitive share
-// holds a.csv beside A.csv. So the destination must also exist and agree
-// with the source. Copies identical in size and time still count as one
-// file: refusing those is loud, and deleting a real one is not. A destination
-// that cannot be read cannot be ruled out, so it counts as well.
-func sameFile(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath string) bool {
+// A match by name is final and is never weighed against a file's size or
+// time: those change under a writer, and a wrong answer here costs the only
+// copy. The one thing that can undo it is two SFTP accounts that do not see
+// the same tree, which sameTree settles.
+func sameFile(src Backend, srcPath string, dst Backend, dstPath string) bool {
 	if a, ok := src.(*Local); ok {
 		b, ok := dst.(*Local)
 		return ok && a.sameFile(srcPath, b, dstPath)
@@ -66,15 +64,12 @@ func sameFile(ctx context.Context, src Backend, srcPath string, dst Backend, dst
 	if err != nil || ida != idb {
 		return false
 	}
-	se, err := src.Stat(ctx, srcPath)
-	if err != nil {
-		return false // the open reports it
+	if s, ok := src.(*SFTP); ok {
+		if d, ok := dst.(*SFTP); ok {
+			return s.sameTree(d, dstPath)
+		}
 	}
-	de, err := dst.Stat(ctx, dstPath)
-	if errors.Is(err, ErrNotFound) {
-		return false
-	}
-	return err != nil || (se.Size == de.Size && se.ModTime.Equal(de.ModTime))
+	return true
 }
 
 // CopyFile streams one file from src to dst. The destination is committed
@@ -82,7 +77,7 @@ func sameFile(ctx context.Context, src Backend, srcPath string, dst Backend, dst
 // copy onto its own source is refused: the callers delete the source after
 // a move, and that would delete the only copy.
 func CopyFile(ctx context.Context, src Backend, srcPath string, dst Backend, dstPath string, opt CopyOptions) (CopyResult, error) {
-	if sameFile(ctx, src, srcPath, dst, dstPath) {
+	if sameFile(src, srcPath, dst, dstPath) {
 		return CopyResult{}, fmt.Errorf("source and destination are the same file (%s)", dstPath)
 	}
 	rc, entry, err := src.Open(ctx, srcPath)

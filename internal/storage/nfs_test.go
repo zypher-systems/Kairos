@@ -207,3 +207,112 @@ func TestNFSOverwriteOffFailsWhenItCannotClaimTheName(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// raceFS lets a test act at the moments between the client's requests. Use
+// a pointer: the NFS server compares filesystems with reflect.DeepEqual,
+// which is never true of a struct holding funcs.
+type raceFS struct {
+	billy.Filesystem
+	afterSymlink func()
+	failRename   func()
+}
+
+func (f *raceFS) Symlink(target, link string) error {
+	err := f.Filesystem.Symlink(target, link)
+	if f.afterSymlink != nil {
+		f.afterSymlink()
+	}
+	return err
+}
+
+func (f *raceFS) Rename(from, to string) error {
+	if f.failRename != nil && strings.HasSuffix(from, ".kairos-part") {
+		f.failRename()
+		return syscall.EIO
+	}
+	return f.Filesystem.Rename(from, to)
+}
+
+func openNFSOn(t *testing.T, fs billy.Filesystem) *NFS {
+	t.Helper()
+	host, portStr, _ := net.SplitHostPort(serveNFS(t, fs))
+	port, _ := strconv.Atoi(portStr)
+	b, err := OpenNFS(context.Background(), Spec{Kind: KindNFS, Host: host, Port: port, Export: "/", UID: 1000, GID: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	return b
+}
+
+// replaceFinal lands another writer's file over whatever is at the name, as
+// an overwrite-on transfer or another NFS client would.
+func replaceFinal(t *testing.T, dir string) func() {
+	return func() {
+		t.Helper()
+		other := filepath.Join(dir, "other-writer")
+		write(t, other, "first")
+		if err := os.Rename(other, filepath.Join(dir, "out.csv")); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A file that takes the name after the claim must not be replaced by the
+// rename that follows it.
+func TestNFSOverwriteOffChecksItsClaimBeforeRenaming(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	b := openNFSOn(t, &raceFS{Filesystem: osfs.New(dir), afterSymlink: replaceFinal(t, dir)})
+	w, err := b.Create(ctx, "out.csv", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("late")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(zeroTime); !errors.Is(err, ErrExists) {
+		t.Fatalf("got %v", err)
+	}
+	if got := read(t, filepath.Join(dir, "out.csv")); got != "first" {
+		t.Fatalf("another writer's file was replaced: %q", got)
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, "*.kairos-part")); len(left) != 0 {
+		t.Fatalf("temp files left behind: %v", left)
+	}
+}
+
+// A failed rename may clear this writer's own claim and nothing else.
+func TestNFSFailedRenameClearsOnlyItsOwnClaim(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("another file took the name", func(t *testing.T) {
+		dir := t.TempDir()
+		b := openNFSOn(t, &raceFS{Filesystem: osfs.New(dir), failRename: replaceFinal(t, dir)})
+		w, err := b.Create(ctx, "out.csv", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Commit(zeroTime); err == nil {
+			t.Fatal("the rename failed; the commit must too")
+		}
+		if got := read(t, filepath.Join(dir, "out.csv")); got != "first" {
+			t.Fatalf("another writer's file was removed: %q", got)
+		}
+	})
+
+	t.Run("the claim is still ours", func(t *testing.T) {
+		dir := t.TempDir()
+		b := openNFSOn(t, &raceFS{Filesystem: osfs.New(dir), failRename: func() {}})
+		w, err := b.Create(ctx, "out.csv", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Commit(zeroTime); err == nil {
+			t.Fatal("the rename failed; the commit must too")
+		}
+		if _, err := os.Lstat(filepath.Join(dir, "out.csv")); !os.IsNotExist(err) {
+			t.Fatalf("the claim must go: %v", err)
+		}
+	})
+}

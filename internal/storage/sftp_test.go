@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/pkg/sftp"
@@ -40,9 +42,14 @@ func openTestSFTP(t *testing.T) *SFTP {
 type limitedCmds struct {
 	sftp.FileCmder
 	replacing bool
+	// failRenames makes that many renames fail, as a passing fault would.
+	failRenames *atomic.Int32
 }
 
 func (c limitedCmds) Filecmd(r *sftp.Request) error {
+	if r.Method == "Rename" && c.failRenames != nil && c.failRenames.Add(-1) >= 0 {
+		return sftp.ErrSSHFxFailure
+	}
 	switch {
 	case r.Method == "Link":
 		return sftp.ErrSSHFxOpUnsupported
@@ -68,10 +75,17 @@ func (w recordingWrites) Filewrite(r *sftp.Request) (io.WriterAt, error) {
 
 func openSFTPWithoutHardLinks(t *testing.T, replacing bool, writes *[]string) *SFTP {
 	t.Helper()
-	cli, srv := net.Pipe()
 	h := sftp.InMemHandler()
-	h.FileCmd = limitedCmds{h.FileCmd, replacing}
+	h.FileCmd = limitedCmds{FileCmder: h.FileCmd, replacing: replacing}
 	h.FilePut = recordingWrites{h.FilePut, writes}
+	return sessionOn(t, h, "")
+}
+
+// sessionOn opens a session on a server's file tree: two sessions on one
+// handler reach the same files, like two logins to one unchrooted host.
+func sessionOn(t *testing.T, h sftp.Handlers, user string) *SFTP {
+	t.Helper()
+	cli, srv := net.Pipe()
 	server := sftp.NewRequestServer(srv, h)
 	go func() { _ = server.Serve() }()
 	client, err := sftp.NewClientPipe(cli, cli)
@@ -82,26 +96,177 @@ func openSFTPWithoutHardLinks(t *testing.T, replacing bool, writes *[]string) *S
 		client.Close()
 		server.Close()
 	})
-	return &SFTP{client: client}
+	return &SFTP{client: client, addr: "host:22", user: user}
+}
+
+// statHook runs once, after the first Stat a server answers: another
+// process changing the file while Kairos looks at it.
+type statHook struct {
+	sftp.FileLister
+	once *sync.Once
+	hook func()
+}
+
+func (l statHook) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
+	lister, err := l.FileLister.Filelist(r)
+	if r.Method == "Stat" {
+		l.once.Do(l.hook)
+	}
+	return lister, err
+}
+
+func sftpFile(t *testing.T, b *SFTP, p, body string) {
+	t.Helper()
+	w, err := b.Create(context.Background(), p, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(w, body); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(zeroTime); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func sftpContent(t *testing.T, b *SFTP, p string) string {
+	t.Helper()
+	f, err := b.client.Open(p)
+	if err != nil {
+		t.Fatalf("%s: %v", p, err)
+	}
+	defer f.Close()
+	data, err := io.ReadAll(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+func sftpParts(t *testing.T, b *SFTP) []string {
+	t.Helper()
+	entries, err := b.client.ReadDir("/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".kairos-part") {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+// A file that changes while Kairos reads its attributes is still one file.
+// Metadata must never turn a self-copy into a copy: the move that follows
+// deletes the only copy.
+func TestSFTPSelfCopyIgnoresChangingAttributes(t *testing.T) {
+	ctx := context.Background()
+	for name, users := range map[string][2]string{
+		"same account":                  {"alice", "alice"},
+		"two accounts on the same tree": {"alice", "bob"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := sftp.InMemHandler()
+			writer := sessionOn(t, h, "writer")
+			sftpFile(t, writer, "/a.csv", "only copy")
+			h.FileList = statHook{h.FileList, &sync.Once{}, func() { sftpFile(t, writer, "/a.csv", "rewritten, and longer") }}
+			src := sessionOn(t, h, users[0])
+			dst := sessionOn(t, h, users[1])
+			_, err := CopyFile(ctx, src, "/a.csv", dst, "/a.csv", CopyOptions{Overwrite: true, Verify: true})
+			if err == nil || !strings.Contains(err.Error(), "same file") {
+				t.Fatalf("a self-copy must be refused: %v", err)
+			}
+			if left := sftpParts(t, writer); len(left) != 0 {
+				t.Fatalf("scratch files left behind: %v", left)
+			}
+		})
+	}
+}
+
+// deniedParts refuses temporary and scratch files: a directory this account
+// cannot write to.
+type deniedParts struct{ sftp.FileWriter }
+
+func (d deniedParts) Filewrite(r *sftp.Request) (io.WriterAt, error) {
+	if strings.HasSuffix(r.Filepath, ".kairos-part") {
+		return nil, sftp.ErrSSHFxPermissionDenied
+	}
+	return d.FileWriter.Filewrite(r)
+}
+
+// Two accounts with the same path where nothing can settle whether they
+// see one tree: refusing is loud, deleting a real file is not.
+func TestSFTPUnsettledAccountsAreRefused(t *testing.T) {
+	src := sessionOn(t, sftp.InMemHandler(), "alice")
+	sftpFile(t, src, "/a.csv", "only copy")
+	h := sftp.InMemHandler()
+	writer := sessionOn(t, h, "writer")
+	sftpFile(t, writer, "/a.csv", "other")
+	h.FilePut = deniedParts{h.FilePut}
+	dst := sessionOn(t, h, "bob")
+	_, err := CopyFile(context.Background(), src, "/a.csv", dst, "/a.csv", CopyOptions{Overwrite: true})
+	if err == nil || !strings.Contains(err.Error(), "same file") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// A failed scratch rename proves nothing on its own: a passing fault looks
+// exactly like a refusal, and SFTP has only the one error code for both.
+func TestSFTPRenameProbeNeedsPositiveEvidence(t *testing.T) {
+	for name, c := range map[string]struct {
+		failRenames int32
+		replacing   bool
+		wantLanded  bool
+	}{
+		"replacing server, one passing fault": {failRenames: 1, replacing: true},
+		"rename not working at all":           {failRenames: 1000},
+		"protocol-following server":           {wantLanded: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			faults := &atomic.Int32{}
+			h := sftp.InMemHandler()
+			h.FileCmd = limitedCmds{FileCmder: h.FileCmd, replacing: c.replacing, failRenames: faults}
+			b := sessionOn(t, h, "")
+			w, err := b.Create(ctx, "/out.csv", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.WriteString(w, "data"); err != nil {
+				t.Fatal(err)
+			}
+			faults.Store(c.failRenames)
+			err = w.Commit(zeroTime)
+			if c.wantLanded {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := sftpContent(t, b, "/out.csv"); got != "data" {
+					t.Fatalf("landed %q", got)
+				}
+			} else {
+				if err == nil || !strings.Contains(err.Error(), "cannot land") {
+					t.Fatalf("an inconclusive probe must fail closed: %v", err)
+				}
+				if _, err := b.client.Lstat("/out.csv"); err == nil {
+					t.Fatal("nothing may land")
+				}
+			}
+			faults.Store(0)
+			if left := sftpParts(t, b); len(left) != 0 {
+				t.Fatalf("scratch files left behind: %v", left)
+			}
+		})
+	}
 }
 
 func TestSFTPOverwriteOffWithoutHardLinks(t *testing.T) {
 	ctx := context.Background()
 	var writes []string
 	b := openSFTPWithoutHardLinks(t, false, &writes)
-	content := func(p string) string {
-		t.Helper()
-		f, err := b.client.Open(p)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer f.Close()
-		data, err := io.ReadAll(f)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return string(data)
-	}
+	content := func(p string) string { return sftpContent(t, b, p) }
 	put := func(p, body string, overwrite bool) Writer {
 		t.Helper()
 		w, err := b.Create(ctx, p, overwrite)
@@ -134,14 +299,8 @@ func TestSFTPOverwriteOffWithoutHardLinks(t *testing.T) {
 	if len(writes) != 0 {
 		t.Fatalf("readers could see an empty file at %v", writes)
 	}
-	entries, err := b.client.ReadDir("/")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".kairos-part") {
-			t.Fatalf("temp file left behind: %s", e.Name())
-		}
+	if left := sftpParts(t, b); len(left) != 0 {
+		t.Fatalf("temp files left behind: %v", left)
 	}
 }
 
@@ -167,14 +326,8 @@ func TestSFTPOverwriteOffFailsOnAReplacingServer(t *testing.T) {
 	if len(writes) != 0 {
 		t.Fatalf("readers could see an empty file at %v", writes)
 	}
-	entries, err := b.client.ReadDir("/")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".kairos-part") {
-			t.Fatalf("temp file left behind: %s", e.Name())
-		}
+	if left := sftpParts(t, b); len(left) != 0 {
+		t.Fatalf("temp files left behind: %v", left)
 	}
 }
 
@@ -185,6 +338,7 @@ func TestSFTPCopyBetweenChrootedAccounts(t *testing.T) {
 	src := openSFTPWithoutHardLinks(t, false, &writes)
 	dst := openSFTPWithoutHardLinks(t, false, &writes)
 	src.addr, dst.addr = "host:22", "host:22"
+	src.user, dst.user = "alice", "bob"
 	w, err := src.Create(ctx, "/out.csv", false)
 	if err != nil {
 		t.Fatal(err)
