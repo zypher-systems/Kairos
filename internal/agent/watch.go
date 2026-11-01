@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -100,10 +101,11 @@ func (w *Watcher) loop(ctx context.Context, fw *fileWatch) {
 }
 
 // poll computes the current signature and reports it once it has been
-// stable across two consecutive polls (settle window). A report the server
-// did not accept stays pending and goes out again on the next poll; the
-// server drops a repeat of a signature it already fired. Only this
-// goroutine touches fw's state, so the network call holds no lock.
+// stable across two consecutive polls (settle window). A report that did
+// not reach the server stays pending and goes out again on the next poll;
+// the server drops a repeat of a signature it already fired. A 4xx answer
+// will not change on a retry, so that report is dropped. Only this goroutine
+// touches fw's state, so the network call holds no lock.
 func (w *Watcher) poll(ctx context.Context, fw *fileWatch) {
 	sig, files, err := globSignature(fw.root, fw.glob)
 	if err != nil {
@@ -125,12 +127,18 @@ func (w *Watcher) poll(ctx context.Context, fw *fileWatch) {
 		return
 	}
 	// Stable change across two polls: report it.
-	if err := w.client.ReportWatch(ctx, fw.jobID, sig, files); err != nil {
+	err = w.client.ReportWatch(ctx, fw.jobID, sig, files)
+	var refused *StatusError
+	if err != nil && (!errors.As(err, &refused) || !refused.Permanent()) {
 		slog.Warn("watch report", "job", fw.jobID, "err", err)
 		return
 	}
 	fw.settle = ""
 	fw.lastSent = sig
+	if err != nil {
+		slog.Warn("watch report refused", "job", fw.jobID, "err", err)
+		return
+	}
 	slog.Info("watch fired", "job", fw.jobID, "glob", fw.glob)
 }
 

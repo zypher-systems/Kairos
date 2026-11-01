@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -123,6 +124,13 @@ func TestRemoteIdentity(t *testing.T) {
 		{"smb is case-insensitive", smbA, "A.csv", smbB, "in/a.CSV", true},
 		{"smb other share", smbA, "a.csv", smbOther, "a.csv", false},
 		{"different kinds never match", nfsA, "a.csv", s3A, "a.csv", false},
+		{"nfs host case", nfsA, "a.csv", &NFS{root: "in", server: "NAS", export: "/vol"}, "a.csv", true},
+		{"nfs export case stays", nfsA, "a.csv", &NFS{root: "in", server: "nas", export: "/VOL"}, "a.csv", false},
+		{"nfs trailing slash on the export", nfsA, "a.csv", &NFS{root: "in", server: "nas", export: "/vol/"}, "a.csv", true},
+		{"s3 host case", s3A, "a.csv", &S3{root: "in", bucket: "b", endpoint: "MinIO:9000"}, "a.csv", true},
+		{"s3 trailing slash", s3A, "a.csv", &S3{root: "in", bucket: "b", endpoint: "minio:9000/"}, "a.csv", true},
+		{"s3 bucket case stays", s3A, "a.csv", &S3{root: "in", bucket: "B", endpoint: "minio:9000"}, "a.csv", false},
+		{"s3 key case stays", s3A, "a.csv", s3A, "A.csv", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -205,21 +213,44 @@ func TestAbortRemovesOnlyItsOwnTemporaryFile(t *testing.T) {
 }
 
 // noHardLinks is a filesystem that refuses link(2), as some FUSE and
-// network mounts do.
-type noHardLinks struct{ tree }
+// network mounts do. It records any non-temporary name opened for writing:
+// that would be an empty file readers can see.
+type noHardLinks struct {
+	tree
+	opened *[]string
+}
 
 func (noHardLinks) Link(string, string) error { return syscall.EPERM }
+
+func (n noHardLinks) OpenFile(name string, flag int, perm fs.FileMode) (*os.File, error) {
+	if !strings.HasSuffix(name, ".kairos-part") {
+		*n.opened = append(*n.opened, name)
+	}
+	return n.tree.OpenFile(name, flag, perm)
+}
+
+// noNoReplace is a filesystem with neither hard links nor a rename that
+// refuses an existing name: it cannot land a file safely with overwrite off.
+type noNoReplace struct{ noHardLinks }
+
+func (noNoReplace) Open(string) (*os.File, error) { return nil, syscall.EINVAL }
 
 // A file that appears at the destination mid-transfer must survive when
 // overwrite is off, however the backend lands the file.
 func TestOverwriteOffHoldsAtCommit(t *testing.T) {
 	ctx := context.Background()
+	var placeholders []string
+	defer func() {
+		if len(placeholders) != 0 {
+			t.Errorf("readers could see an empty file at %v", placeholders)
+		}
+	}()
 	for _, c := range []struct {
 		name string
 		wrap func(*Local)
 	}{
 		{"hard links", func(*Local) {}},
-		{"no hard links", func(l *Local) { l.dir = noHardLinks{l.dir} }},
+		{"no hard links", func(l *Local) { l.dir = noHardLinks{l.dir, &placeholders} }},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -261,6 +292,32 @@ func TestOverwriteOffHoldsAtCommit(t *testing.T) {
 				t.Fatalf("temp files left behind: %v", left)
 			}
 		})
+	}
+}
+
+// Storage with no atomic way to keep an existing name must fail the commit:
+// neither a blind rename nor an empty placeholder is safe.
+func TestOverwriteOffFailsWhenItCannotBeHonoured(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	b := mustLocal(t, root)
+	var placeholders []string
+	b.dir = noNoReplace{noHardLinks{b.dir, &placeholders}}
+	w, err := b.Create(ctx, "out.csv", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(zeroTime); err == nil || !strings.Contains(err.Error(), "cannot land") {
+		t.Fatalf("must fail and say why: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "out.csv")); !os.IsNotExist(err) {
+		t.Fatalf("nothing may land: %v", err)
+	}
+	if left, _ := filepath.Glob(filepath.Join(root, "*.kairos-part")); len(left) != 0 {
+		t.Fatalf("temp files left behind: %v", left)
 	}
 }
 
