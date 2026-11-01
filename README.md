@@ -2,7 +2,7 @@
 
 Self-hosted job orchestrator. A Go server schedules work and runs it on Linux hosts via polling agents or SSH — shell scripts, Docker containers, and SFTP file transfers, triggered by schedules or file arrivals.
 
-Version **1.18.0**. Kairos is open source. Every feature ships with the binary: scheduler, storage locations (mounts, SFTP, S3, agent directories) and transfers, workflows, notifications, metrics, API tokens, extra accounts, the audit log, YAML and git sync, OIDC SSO, retention, log search, SLA alerts, approval gates, Vault secret stores, skip-day calendars, and extra API replicas.
+Version **1.18.1**. Kairos is open source. Every feature ships with the binary: scheduler, storage locations (mounts, SFTP, S3, agent directories) and transfers, workflows, notifications, metrics, API tokens, extra accounts, the audit log, YAML and git sync, OIDC SSO, retention, log search, SLA alerts, approval gates, Vault secret stores, skip-day calendars, and extra API replicas.
 
 ## Requirements
 
@@ -16,7 +16,7 @@ Published to GitHub Container Registry for linux/amd64 and linux/arm64:
 - `ghcr.io/zypher-systems/kairos` — server, with the agent binaries it hands to hosts
 - `ghcr.io/zypher-systems/kairos-agent` — the worker
 
-`latest` and the current version (`1.18.0`) follow `main`. Every build is also tagged `sha-<commit>`.
+`latest` and the current version (`1.18.1`) follow `main`. Every build is also tagged `sha-<commit>`.
 
 ## Quick start
 
@@ -90,7 +90,7 @@ Keep a copy of `KAIROS_SECRET` with your backups. Without it, stored job secrets
 Optional `.env` settings:
 
 ```bash
-KAIROS_VERSION=1.18.0       # pin a release instead of latest
+KAIROS_VERSION=1.18.1       # pin a release instead of latest
 KAIROS_HTTP_PORT=8080       # UI + API port
 KAIROS_PG_PORT=5433         # if something on the host already uses 5432
 KAIROS_PUBLIC_URL=https://kairos.example.com   # behind a reverse proxy

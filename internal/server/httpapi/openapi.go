@@ -16,5 +16,5 @@ func (a *API) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(openAPISpec)
 		return
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{"openapi": "3.0.3", "info": map[string]string{"title": "Kairos API", "version": "1.18.0"}})
+	_ = json.NewEncoder(w).Encode(map[string]any{"openapi": "3.0.3", "info": map[string]string{"title": "Kairos API", "version": "1.18.1"}})
 }

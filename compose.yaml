@@ -4,7 +4,7 @@ services:
   # ---------------------------------------------------------------- runtime
   server:
     build: .
-    image: ghcr.io/zypher-systems/kairos:${KAIROS_VERSION:-1.18.0}
+    image: ghcr.io/zypher-systems/kairos:${KAIROS_VERSION:-1.18.1}
     restart: unless-stopped
     # Host networking so the server can SSH/SFTP to machines on your LAN
     # and beyond by IP — a scheduler that can't reach its targets is not
@@ -38,7 +38,7 @@ services:
   server-2:
     profiles: ["ha"]
     build: .
-    image: ghcr.io/zypher-systems/kairos:${KAIROS_VERSION:-1.18.0}
+    image: ghcr.io/zypher-systems/kairos:${KAIROS_VERSION:-1.18.1}
     restart: unless-stopped
     # Second replica on a distinct host port — host networking cannot share :8080.
     # Put a reverse proxy in front of 8080+8081 for a single URL. Same Postgres,
@@ -120,7 +120,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.agent
-    image: ghcr.io/zypher-systems/kairos-agent:${KAIROS_VERSION:-1.18.0}
+    image: ghcr.io/zypher-systems/kairos-agent:${KAIROS_VERSION:-1.18.1}
     profiles: ["dev"]
     environment:
       # Server runs host-networked; the dev agent reaches it via the host
