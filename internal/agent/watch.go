@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -103,9 +104,10 @@ func (w *Watcher) loop(ctx context.Context, fw *fileWatch) {
 // poll computes the current signature and reports it once it has been
 // stable across two consecutive polls (settle window). A report that did
 // not reach the server stays pending and goes out again on the next poll;
-// the server drops a repeat of a signature it already fired. A 4xx answer
-// will not change on a retry, so that report is dropped. Only this goroutine
-// touches fw's state, so the network call holds no lock.
+// the server drops a repeat of a signature it already fired. Only a definite
+// refusal drops a report. Polls are at least ten seconds apart, which is
+// backoff enough. Only this goroutine touches fw's state, so the network
+// call holds no lock.
 func (w *Watcher) poll(ctx context.Context, fw *fileWatch) {
 	sig, files, err := globSignature(fw.root, fw.glob)
 	if err != nil {
@@ -128,8 +130,7 @@ func (w *Watcher) poll(ctx context.Context, fw *fileWatch) {
 	}
 	// Stable change across two polls: report it.
 	err = w.client.ReportWatch(ctx, fw.jobID, sig, files)
-	var refused *StatusError
-	if err != nil && (!errors.As(err, &refused) || !refused.Permanent()) {
+	if err != nil && !refusedForGood(err) {
 		slog.Warn("watch report", "job", fw.jobID, "err", err)
 		return
 	}
@@ -140,6 +141,22 @@ func (w *Watcher) poll(ctx context.Context, fw *fileWatch) {
 		return
 	}
 	slog.Info("watch fired", "job", fw.jobID, "glob", fw.glob)
+}
+
+// refusedForGood reports an answer that will not change on a retry: the job
+// is gone or the watch is no longer this agent's. StatusError.Permanent is
+// too broad here. A proxy's 408, a 429 or a 401 can pass, and losing an
+// arrival costs more than repeating a report.
+func refusedForGood(err error) bool {
+	var se *StatusError
+	if !errors.As(err, &se) {
+		return false
+	}
+	switch se.Code {
+	case http.StatusBadRequest, http.StatusForbidden, http.StatusNotFound, http.StatusGone:
+		return true
+	}
+	return false
 }
 
 // globSignature hashes the sorted matched-file set (name+size+mtime) and

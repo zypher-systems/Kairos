@@ -10,6 +10,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/willscott/go-nfs-client/nfs"
@@ -41,24 +42,21 @@ func OpenNFS(ctx context.Context, s Spec) (*NFS, error) {
 		b   *NFS
 		err error
 	}
-	done := make(chan result, 1)
-	go func() {
+	connect := func() (*NFS, error) {
 		var m *nfs.Mount
 		if s.Port != 0 {
 			// A fixed port serves both MOUNT and NFS (appliances and
 			// userspace servers that run without a portmapper).
 			client, err := rpc.DialTCP("tcp", net.JoinHostPort(host, fmt.Sprint(s.Port)), false)
 			if err != nil {
-				done <- result{nil, fmt.Errorf("nfs dial %s:%d: %w", host, s.Port, err)}
-				return
+				return nil, fmt.Errorf("nfs dial %s:%d: %w", host, s.Port, err)
 			}
 			m = &nfs.Mount{Client: client}
 		} else {
 			var err error
 			m, err = nfs.DialMount(host, 0)
 			if err != nil {
-				done <- result{nil, fmt.Errorf("nfs dial %s (portmapper): %w", host, err)}
-				return
+				return nil, fmt.Errorf("nfs dial %s (portmapper): %w", host, err)
 			}
 		}
 		auth := rpc.NewAuthUnix("kairos", s.UID, s.GID)
@@ -69,16 +67,28 @@ func OpenNFS(ctx context.Context, s Spec) (*NFS, error) {
 		t, err := m.Mount(export, auth.Auth())
 		if err != nil {
 			m.Close()
-			done <- result{nil, fmt.Errorf("nfs mount %s:%s: %w", host, s.Export, err)}
-			return
+			return nil, fmt.Errorf("nfs mount %s:%s: %w", host, s.Export, err)
 		}
-		done <- result{&NFS{
+		return &NFS{
 			root:   strings.Trim(strings.TrimSpace(s.Root), "/"),
 			server: host,
 			export: export,
 			mount:  m,
 			target: t,
-		}, nil}
+		}, nil
+	}
+	done := make(chan result, 1)
+	go func() {
+		// The client binds a random source port and retries a taken one
+		// only in privileged mode, which this is not.
+		var b *NFS
+		var err error
+		for range 8 {
+			if b, err = connect(); !errors.Is(err, syscall.EADDRINUSE) {
+				break
+			}
+		}
+		done <- result{b, err}
 	}()
 	select {
 	case r := <-done:
@@ -256,16 +266,33 @@ func (w *nfsWriter) Commit(modTime time.Time) error {
 			w.b.target.Remove(w.tmp)
 			return err
 		}
+		if !w.claimed() {
+			w.b.target.Remove(w.tmp)
+			return ErrExists
+		}
 	}
-	// NFS rename replaces an existing target atomically.
+	// NFS rename replaces an existing target atomically. NFSv3 has no
+	// exclusive rename, so with overwrite off a file landing between the
+	// check above and this request would still be replaced.
 	if err := w.b.target.Rename(w.tmp, w.final); err != nil {
-		w.b.target.Remove(w.tmp)
-		if !w.overwrite {
+		if !w.overwrite && w.claimed() {
 			w.b.target.Remove(w.final)
 		}
+		w.b.target.Remove(w.tmp)
 		return fmt.Errorf("rename into place: %w", err)
 	}
 	return nil
+}
+
+// claimed reports whether the final name is still this writer's link to its
+// temporary file. Anything else there belongs to someone else.
+func (w *nfsWriter) claimed() bool {
+	f, err := w.b.target.Open(w.final)
+	if err != nil {
+		return false
+	}
+	target, err := f.Readlink()
+	return err == nil && target == path.Base(w.tmp)
 }
 
 // claim takes the final name for overwrite off, because the rename would
