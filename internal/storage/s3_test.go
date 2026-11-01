@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -91,9 +92,14 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		final(body)
 	case r.Method == http.MethodHead:
-		if _, ok := f.objects[key]; !ok {
+		body, ok := f.objects[key]
+		if !ok {
 			w.WriteHeader(http.StatusNotFound)
+			return
 		}
+		w.Header().Set("ETag", `"etag"`)
+		w.Header().Set("Last-Modified", "Mon, 02 Jan 2006 15:04:05 GMT")
+		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
@@ -197,7 +203,7 @@ func TestS3OverwriteOnReplaces(t *testing.T) {
 // The condition must reach the request that makes the object visible, both
 // for a single PUT and for the completion of a multipart upload, where the
 // data is already in the store and only that request decides.
-func TestPutIfAbsent(t *testing.T) {
+func TestUploadIfAbsent(t *testing.T) {
 	body := strings.Repeat("0123456789", 10)
 	sizes := map[string]int64{"single put": 1 << 20, "multipart": 16, "exact parts": 25}
 	cases := []struct {
@@ -216,7 +222,7 @@ func TestPutIfAbsent(t *testing.T) {
 				b, f := openFakeS3(t)
 				b.partSize = size
 				c.prepare(f)
-				err := b.putIfAbsent(context.Background(), "out.csv", strings.NewReader(body))
+				err := b.upload(context.Background(), "out.csv", strings.NewReader(body), true)
 				if !errors.Is(err, c.want) {
 					t.Fatalf("got %v want %v", err, c.want)
 				}
@@ -232,11 +238,11 @@ func TestPutIfAbsent(t *testing.T) {
 }
 
 // An interrupted source must not become a short object.
-func TestPutIfAbsentAbortsWhenTheSourceFails(t *testing.T) {
+func TestUploadAbortsWhenTheSourceFails(t *testing.T) {
 	b, f := openFakeS3(t)
 	b.partSize = 4
 	src := io.MultiReader(strings.NewReader("0123456789"), failingReader{})
-	if err := b.putIfAbsent(context.Background(), "out.csv", src); !errors.Is(err, errSourceFailed) {
+	if err := b.upload(context.Background(), "out.csv", src, true); !errors.Is(err, errSourceFailed) {
 		t.Fatalf("got %v", err)
 	}
 	if _, ok := f.objects["out.csv"]; ok || f.aborted != 1 {
@@ -249,6 +255,32 @@ var errSourceFailed = errors.New("source failed")
 type failingReader struct{}
 
 func (failingReader) Read([]byte) (int, error) { return 0, errSourceFailed }
+
+// A small object must not reserve the buffer a 5 TiB upload needs.
+func TestSmallUploadsStaySmall(t *testing.T) {
+	for _, overwrite := range []bool{false, true} {
+		b, f := openFakeS3(t)
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		w, err := b.Create(context.Background(), "small.csv", overwrite)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(w, "small"); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Commit(zeroTime); err != nil {
+			t.Fatal(err)
+		}
+		runtime.ReadMemStats(&after)
+		if got := after.TotalAlloc - before.TotalAlloc; got > 64<<20 {
+			t.Fatalf("overwrite=%v: a 5-byte upload allocated %d MiB", overwrite, got>>20)
+		}
+		if got := f.object("small.csv"); got != "small" {
+			t.Fatalf("landed %q", got)
+		}
+	}
+}
 
 func TestS3CopyRefusesTheSameObject(t *testing.T) {
 	b, f := openFakeS3(t)

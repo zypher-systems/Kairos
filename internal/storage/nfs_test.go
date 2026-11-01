@@ -8,8 +8,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
+	"github.com/go-git/go-billy/v5"
 	"github.com/go-git/go-billy/v5/osfs"
 	nfsserver "github.com/willscott/go-nfs"
 	nfshelper "github.com/willscott/go-nfs/helpers"
@@ -20,11 +22,16 @@ import (
 // needed here either.
 func startNFSServer(t *testing.T, dir string) (host string) {
 	t.Helper()
+	return serveNFS(t, osfs.New(dir))
+}
+
+func serveNFS(t *testing.T, fs billy.Filesystem) (host string) {
+	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := nfshelper.NewNullAuthHandler(osfs.New(dir))
+	handler := nfshelper.NewNullAuthHandler(fs)
 	go func() { _ = nfsserver.Serve(l, nfshelper.NewCachingHandler(handler, 1024)) }()
 	t.Cleanup(func() { l.Close() })
 	return l.Addr().String()
@@ -151,5 +158,52 @@ func TestNFSConcurrentWritersKeepTheirOwnBytes(t *testing.T) {
 	}
 	if got := read(t, filepath.Join(dir, "out.csv")); got != "second" {
 		t.Fatalf("second commit landed %q", got)
+	}
+}
+
+// noSymlinkFS is an export that refuses symlinks, as some NAS shares do.
+type noSymlinkFS struct{ billy.Filesystem }
+
+func (noSymlinkFS) Symlink(string, string) error { return syscall.EPERM }
+
+// Without symlinks nothing can claim the name, and an NFS rename replaces,
+// so overwrite off must fail the commit rather than rename and hope.
+func TestNFSOverwriteOffFailsWhenItCannotClaimTheName(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	host, portStr, _ := net.SplitHostPort(serveNFS(t, noSymlinkFS{osfs.New(dir)}))
+	port, _ := strconv.Atoi(portStr)
+	b, err := OpenNFS(ctx, Spec{Kind: KindNFS, Host: host, Port: port, Export: "/", UID: 1000, GID: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	w, err := b.Create(ctx, "out.csv", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(zeroTime); err == nil || !strings.Contains(err.Error(), "cannot land") {
+		t.Fatalf("must fail and say why: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "out.csv")); !os.IsNotExist(err) {
+		t.Fatalf("nothing may land: %v", err)
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, "*.kairos-part")); len(left) != 0 {
+		t.Fatalf("temp files left behind: %v", left)
+	}
+
+	// Overwrite on needs no claim.
+	w, err = b.Create(ctx, "out.csv", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(zeroTime); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -34,22 +34,44 @@ func openTestSFTP(t *testing.T) *SFTP {
 	return &SFTP{client: client}
 }
 
-// noHardLinkCmds answers the hard-link request the way a server without the
-// OpenSSH extension does.
-type noHardLinkCmds struct{ sftp.FileCmder }
+// limitedCmds answers the hard-link request the way a server without the
+// OpenSSH extension does. With replacing set, its plain rename replaces an
+// existing file, which the protocol forbids and some servers do anyway.
+type limitedCmds struct {
+	sftp.FileCmder
+	replacing bool
+}
 
-func (c noHardLinkCmds) Filecmd(r *sftp.Request) error {
-	if r.Method == "Link" {
+func (c limitedCmds) Filecmd(r *sftp.Request) error {
+	switch {
+	case r.Method == "Link":
 		return sftp.ErrSSHFxOpUnsupported
+	case r.Method == "Rename" && c.replacing:
+		return c.FileCmder.(sftp.PosixRenameFileCmder).PosixRename(r)
 	}
 	return c.FileCmder.Filecmd(r)
 }
 
-func openSFTPWithoutHardLinks(t *testing.T) *SFTP {
+// recordingWrites records the names opened for writing at the destination:
+// an empty file there is one readers can see.
+type recordingWrites struct {
+	sftp.FileWriter
+	names *[]string
+}
+
+func (w recordingWrites) Filewrite(r *sftp.Request) (io.WriterAt, error) {
+	if !strings.HasSuffix(r.Filepath, ".kairos-part") {
+		*w.names = append(*w.names, r.Filepath)
+	}
+	return w.FileWriter.Filewrite(r)
+}
+
+func openSFTPWithoutHardLinks(t *testing.T, replacing bool, writes *[]string) *SFTP {
 	t.Helper()
 	cli, srv := net.Pipe()
 	h := sftp.InMemHandler()
-	h.FileCmd = noHardLinkCmds{h.FileCmd}
+	h.FileCmd = limitedCmds{h.FileCmd, replacing}
+	h.FilePut = recordingWrites{h.FilePut, writes}
 	server := sftp.NewRequestServer(srv, h)
 	go func() { _ = server.Serve() }()
 	client, err := sftp.NewClientPipe(cli, cli)
@@ -65,7 +87,8 @@ func openSFTPWithoutHardLinks(t *testing.T) *SFTP {
 
 func TestSFTPOverwriteOffWithoutHardLinks(t *testing.T) {
 	ctx := context.Background()
-	b := openSFTPWithoutHardLinks(t)
+	var writes []string
+	b := openSFTPWithoutHardLinks(t, false, &writes)
 	content := func(p string) string {
 		t.Helper()
 		f, err := b.client.Open(p)
@@ -108,6 +131,9 @@ func TestSFTPOverwriteOffWithoutHardLinks(t *testing.T) {
 	if got := content("/out.csv"); got != "first" {
 		t.Fatalf("destination replaced with overwrite off: %q", got)
 	}
+	if len(writes) != 0 {
+		t.Fatalf("readers could see an empty file at %v", writes)
+	}
 	entries, err := b.client.ReadDir("/")
 	if err != nil {
 		t.Fatal(err)
@@ -116,6 +142,75 @@ func TestSFTPOverwriteOffWithoutHardLinks(t *testing.T) {
 		if strings.HasSuffix(e.Name(), ".kairos-part") {
 			t.Fatalf("temp file left behind: %s", e.Name())
 		}
+	}
+}
+
+// A server whose rename replaces, without hard links, offers no safe way
+// to land a file with overwrite off. The commit must fail, not replace.
+func TestSFTPOverwriteOffFailsOnAReplacingServer(t *testing.T) {
+	ctx := context.Background()
+	var writes []string
+	b := openSFTPWithoutHardLinks(t, true, &writes)
+	w, err := b.Create(ctx, "/out.csv", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(w, "data"); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(zeroTime); err == nil || !strings.Contains(err.Error(), "cannot land") {
+		t.Fatalf("must fail and say why: %v", err)
+	}
+	if _, err := b.client.Lstat("/out.csv"); err == nil {
+		t.Fatal("nothing may land")
+	}
+	if len(writes) != 0 {
+		t.Fatalf("readers could see an empty file at %v", writes)
+	}
+	entries, err := b.client.ReadDir("/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".kairos-part") {
+			t.Fatalf("temp file left behind: %s", e.Name())
+		}
+	}
+}
+
+// Accounts chrooted on one host report the same paths for different files.
+func TestSFTPCopyBetweenChrootedAccounts(t *testing.T) {
+	ctx := context.Background()
+	var writes []string
+	src := openSFTPWithoutHardLinks(t, false, &writes)
+	dst := openSFTPWithoutHardLinks(t, false, &writes)
+	src.addr, dst.addr = "host:22", "host:22"
+	w, err := src.Create(ctx, "/out.csv", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(w, "payload"); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(zeroTime); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CopyFile(ctx, src, "/out.csv", dst, "/out.csv", CopyOptions{}); err != nil {
+		t.Fatalf("an empty namespace on the same host: %v", err)
+	}
+	// A different file already at that path is an overwrite, not a self-copy.
+	w, err = dst.Create(ctx, "/out.csv", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(w, "something else entirely"); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(zeroTime); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CopyFile(ctx, src, "/out.csv", dst, "/out.csv", CopyOptions{Overwrite: true}); err != nil {
+		t.Fatalf("a different file at the same path: %v", err)
 	}
 }
 

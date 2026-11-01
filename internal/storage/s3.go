@@ -24,10 +24,14 @@ type S3 struct {
 	bucket   string
 	endpoint string
 	client   *minio.Client
-	// partSize overrides the upload part size; zero sizes parts for the
-	// largest object S3 allows.
+	// partSize overrides every upload part size; zero means s3FirstPart,
+	// then parts sized for the largest object S3 allows.
 	partSize int64
 }
+
+// s3FirstPart is read before an upload commits to anything. A smaller object
+// is one PUT, so it never reserves the buffer a 5 TiB upload needs.
+const s3FirstPart = 16 << 20
 
 // OpenS3 builds the client for a spec. Endpoint empty means AWS in Region.
 func OpenS3(ctx context.Context, s Spec) (*S3, error) {
@@ -91,7 +95,7 @@ func (b *S3) identity(p string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return "s3://" + b.endpoint + "/" + b.bucket + "/" + key, nil
+	return "s3://" + strings.ToLower(strings.TrimRight(b.endpoint, "/")) + "/" + b.bucket + "/" + key, nil
 }
 
 func (b *S3) rel(key string) string {
@@ -164,7 +168,7 @@ func (b *S3) Open(ctx context.Context, p string) (io.ReadCloser, Entry, error) {
 }
 
 // Create streams the upload through a pipe so a large file never sits in
-// memory; PutObject runs in the background until Commit.
+// memory; the upload runs in the background until Commit.
 func (b *S3) Create(ctx context.Context, p string, overwrite bool) (Writer, error) {
 	key, err := b.key(p)
 	if err != nil {
@@ -178,12 +182,7 @@ func (b *S3) Create(ctx context.Context, p string, overwrite bool) (Writer, erro
 	pr, pw := io.Pipe()
 	w := &s3Writer{pw: pw, done: make(chan error, 1)}
 	go func() {
-		var err error
-		if overwrite {
-			_, err = b.client.PutObject(ctx, b.bucket, key, pr, -1, minio.PutObjectOptions{})
-		} else {
-			err = b.putIfAbsent(ctx, key, pr)
-		}
+		err := b.upload(ctx, key, pr, !overwrite)
 		if err != nil {
 			pr.CloseWithError(err)
 		} else {
@@ -194,24 +193,28 @@ func (b *S3) Create(ctx context.Context, p string, overwrite bool) (Writer, erro
 	return w, nil
 }
 
-// putIfAbsent uploads r to key unless the key exists by the time the upload
-// finishes. The check in Create cannot promise that: a whole file passes
-// between it and the commit. The request that makes the object visible
-// carries If-None-Match, which PutObject cannot do: it drops custom headers
-// from the request that completes a streaming upload.
-func (b *S3) putIfAbsent(ctx context.Context, key string, r io.Reader) error {
+// upload streams r to key. With exclusive set the object lands only if the
+// key is still free when the upload finishes: the check in Create cannot
+// promise that, since a whole file passes between it and the commit. The
+// request that makes the object visible carries If-None-Match, which
+// PutObject cannot do: it drops custom headers from the request completing
+// a streaming upload.
+func (b *S3) upload(ctx context.Context, key string, r io.Reader, exclusive bool) error {
 	core := minio.Core{Client: b.client}
-	partSize := b.partSize
-	if partSize == 0 {
-		var err error
-		if _, partSize, _, err = minio.OptimalPartInfo(-1, 0); err != nil {
-			return err
+	land := func(write func(minio.PutObjectOptions) error) error {
+		if exclusive {
+			return ifAbsent(write)
 		}
+		return write(minio.PutObjectOptions{})
 	}
-	buf := make([]byte, partSize)
+	size := b.partSize
+	if size == 0 {
+		size = s3FirstPart
+	}
+	buf := make([]byte, size)
 	n, err := io.ReadFull(r, buf)
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return ifAbsent(func(opts minio.PutObjectOptions) error {
+		return land(func(opts minio.PutObjectOptions) error {
 			_, err := core.PutObject(ctx, b.bucket, key, bytes.NewReader(buf[:n]), int64(n), "", "", opts)
 			return err
 		})
@@ -237,6 +240,15 @@ func (b *S3) putIfAbsent(ctx context.Context, key string, r io.Reader) error {
 			return err
 		}
 		parts = append(parts, minio.CompletePart{PartNumber: num, ETag: part.ETag})
+		if num == 1 && b.partSize == 0 {
+			// Past one part the object can be any size, and S3 allows
+			// 10,000 parts, so the rest are sized for the limit.
+			_, rest, _, err := minio.OptimalPartInfo(-1, 0)
+			if err != nil {
+				return err
+			}
+			buf = make([]byte, rest)
+		}
 		n, err = io.ReadFull(r, buf)
 		if errors.Is(err, io.EOF) {
 			break
@@ -245,7 +257,7 @@ func (b *S3) putIfAbsent(ctx context.Context, key string, r io.Reader) error {
 			return err
 		}
 	}
-	err = ifAbsent(func(opts minio.PutObjectOptions) error {
+	err = land(func(opts minio.PutObjectOptions) error {
 		_, err := core.CompleteMultipartUpload(ctx, b.bucket, key, id, parts, opts)
 		return err
 	})

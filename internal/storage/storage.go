@@ -143,6 +143,11 @@ type Backend interface {
 // ErrExists is returned by Create when the target exists and overwrite is off.
 var ErrExists = errors.New("destination exists")
 
+// errCannotLand is returned by Commit with overwrite off when the storage
+// has no atomic way to take the final name without replacing what is there.
+// The file is not landed: that would break the promise overwrite off makes.
+var errCannotLand = errors.New("this storage cannot land a file without risking a replace, so a transfer with overwrite off cannot finish here")
+
 // ErrNotFound is returned for a missing file.
 var ErrNotFound = errors.New("file not found")
 

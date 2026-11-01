@@ -71,7 +71,9 @@ func (b *SFTP) abs(p string) (string, error) {
 
 // identity asks the server for the real path, which sees through symlinks
 // and anchors a path relative to the login directory. The user is left out
-// on purpose: two accounts on one host reach the same files.
+// on purpose: two accounts on one host usually reach the same files. Where
+// they are chrooted they do not, which sameFile settles by comparing the
+// files themselves.
 func (b *SFTP) identity(p string) (string, error) {
 	abs, err := b.abs(p)
 	if err != nil {
@@ -80,7 +82,7 @@ func (b *SFTP) identity(p string) (string, error) {
 	if real, err := b.client.RealPath(abs); err == nil {
 		abs = real
 	}
-	return "sftp://" + b.addr + "/" + strings.TrimPrefix(abs, "/"), nil
+	return "sftp://" + strings.ToLower(b.addr) + "/" + strings.TrimPrefix(abs, "/"), nil
 }
 
 func (b *SFTP) rel(abs string) string {
@@ -195,14 +197,11 @@ func (w *sftpWriter) Commit(modTime time.Time) error {
 		_ = w.b.client.Chtimes(w.tmp, time.Now(), modTime)
 	}
 	if !w.overwrite {
-		landed, err := w.claim()
-		if err != nil {
+		if err := w.landExclusive(); err != nil {
 			w.b.client.Remove(w.tmp)
 			return err
 		}
-		if landed {
-			return nil
-		}
+		return nil
 	}
 	// Most SFTP servers refuse rename onto an existing file; posix-rename
 	// replaces atomically where supported.
@@ -217,28 +216,52 @@ func (w *sftpWriter) Commit(modTime time.Time) error {
 	return nil
 }
 
-// claim takes the final name for overwrite off; a plain rename cannot be
-// trusted with that, since some servers let it replace. A hard link lands
-// the whole file at once and fails on an existing name. Without hard links
-// the name is created empty and exclusively for the rename to replace, and
-// landed is false.
-func (w *sftpWriter) claim() (landed bool, err error) {
+// landExclusive lands the file without replacing anything. A hard link does
+// that atomically. Without the hard-link extension the protocol's plain
+// rename does too, but only on servers that follow the protocol, so that is
+// checked first; on a server whose rename replaces there is no safe way to
+// land the file, and the commit fails.
+func (w *sftpWriter) landExclusive() error {
 	c := w.b.client
 	if err := c.Link(w.tmp, w.final); err == nil {
 		_ = c.Remove(w.tmp)
-		return true, nil
+		return nil
 	}
 	if _, err := c.Lstat(w.final); err == nil {
-		return false, ErrExists
+		return ErrExists
 	}
-	fh, err := c.OpenFile(w.final, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
+	safe, err := w.renameRefusesExisting()
 	if err != nil {
-		if _, serr := c.Lstat(w.final); serr == nil {
-			return false, ErrExists
-		}
-		return false, fmt.Errorf("claim %s: %w", w.final, err)
+		return fmt.Errorf("%w: %v", errCannotLand, err)
 	}
-	return false, fh.Close()
+	if !safe {
+		return fmt.Errorf("%w: its rename replaces existing files and it has no hard links", errCannotLand)
+	}
+	if err := c.Rename(w.tmp, w.final); err != nil {
+		if _, serr := c.Lstat(w.final); serr == nil {
+			return ErrExists
+		}
+		return fmt.Errorf("rename %s into place: %w", w.tmp, err)
+	}
+	return nil
+}
+
+// renameRefusesExisting tries the server's plain rename on two scratch files
+// beside the destination.
+func (w *sftpWriter) renameRefusesExisting() (bool, error) {
+	c := w.b.client
+	from, to := partName(w.final), partName(w.final)
+	for _, p := range []string{from, to} {
+		fh, err := c.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
+		if err != nil {
+			return false, err
+		}
+		defer c.Remove(p)
+		if err := fh.Close(); err != nil {
+			return false, err
+		}
+	}
+	return c.Rename(from, to) != nil, nil
 }
 
 func (w *sftpWriter) Abort() error {

@@ -245,10 +245,10 @@ func (w *localWriter) Commit(modTime time.Time) error {
 }
 
 // land moves the finished temporary file to its final name. With overwrite
-// off it must not replace a file that appeared during the transfer, so it
-// cannot simply rename: a hard link fails on an existing name. On a
-// filesystem without hard links the name is created empty and exclusively
-// first, and the rename replaces that.
+// off it must not replace a file that appeared during the transfer, and
+// readers must never see anything but the whole file. A hard link does both,
+// and so does a no-replace rename on a filesystem without hard links. On one
+// with neither there is no safe way to land the file, so the commit fails.
 func (w *localWriter) land() error {
 	if w.overwrite {
 		return w.dir.Rename(w.tmp, w.final)
@@ -261,17 +261,12 @@ func (w *localWriter) land() error {
 	if errors.Is(err, fs.ErrExist) {
 		return ErrExists
 	}
-	fh, err := w.dir.OpenFile(w.final, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	err = renameNoReplace(w.dir, w.tmp, w.final)
 	if errors.Is(err, fs.ErrExist) {
 		return ErrExists
 	}
 	if err != nil {
-		return err
-	}
-	fh.Close()
-	if err := w.dir.Rename(w.tmp, w.final); err != nil {
-		w.dir.Remove(w.final)
-		return err
+		return fmt.Errorf("%w: %v", errCannotLand, err)
 	}
 	return nil
 }

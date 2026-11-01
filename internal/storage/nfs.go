@@ -74,7 +74,7 @@ func OpenNFS(ctx context.Context, s Spec) (*NFS, error) {
 		}
 		done <- result{&NFS{
 			root:   strings.Trim(strings.TrimSpace(s.Root), "/"),
-			server: fmt.Sprintf("%s:%d", host, s.Port),
+			server: host,
 			export: export,
 			mount:  m,
 			target: t,
@@ -109,7 +109,7 @@ func (b *NFS) identity(p string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return "nfs://" + b.server + strings.TrimRight(b.export, "/") + "/" + abs, nil
+	return "nfs://" + strings.ToLower(b.server) + strings.TrimRight(b.export, "/") + "/" + abs, nil
 }
 
 func (b *NFS) rel(abs string) string {
@@ -251,10 +251,8 @@ func (w *nfsWriter) Commit(modTime time.Time) error {
 			Mtime: nfs.SetTime{SetIt: nfs.SetToClientTime, Time: nfs.NFS3Time{Seconds: uint32(modTime.Unix()), Nseconds: uint32(modTime.Nanosecond())}},
 		})
 	}
-	claimed := false
 	if !w.overwrite {
-		var err error
-		if claimed, err = w.claim(); err != nil {
+		if err := w.claim(); err != nil {
 			w.b.target.Remove(w.tmp)
 			return err
 		}
@@ -262,7 +260,7 @@ func (w *nfsWriter) Commit(modTime time.Time) error {
 	// NFS rename replaces an existing target atomically.
 	if err := w.b.target.Rename(w.tmp, w.final); err != nil {
 		w.b.target.Remove(w.tmp)
-		if claimed {
+		if !w.overwrite {
 			w.b.target.Remove(w.final)
 		}
 		return fmt.Errorf("rename into place: %w", err)
@@ -274,16 +272,17 @@ func (w *nfsWriter) Commit(modTime time.Time) error {
 // replace whatever is there. The client has no exclusive create, but
 // SYMLINK is atomic and fails on an existing name, and this link points at
 // the finished temporary file, so a reader sees the whole file from here
-// on. An export that refuses symlinks is left with the lookup: the check
-// is then only as good as the one in Create.
-func (w *nfsWriter) claim() (claimed bool, err error) {
-	if err := w.b.target.Symlink(path.Base(w.tmp), w.final); err == nil {
-		return true, nil
+// on. An export that refuses symlinks offers no way to take the name, so
+// the commit fails.
+func (w *nfsWriter) claim() error {
+	err := w.b.target.Symlink(path.Base(w.tmp), w.final)
+	if err == nil {
+		return nil
 	}
-	if _, _, err := w.b.target.Lookup(w.final); err == nil {
-		return false, ErrExists
+	if _, _, lerr := w.b.target.Lookup(w.final); lerr == nil {
+		return ErrExists
 	}
-	return false, nil
+	return fmt.Errorf("%w: %v", errCannotLand, err)
 }
 
 func (w *nfsWriter) Abort() error {
