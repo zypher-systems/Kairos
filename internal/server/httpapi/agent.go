@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/zypher-systems/kairos/internal/protocol"
 	"github.com/zypher-systems/kairos/internal/server/endpoints"
@@ -38,8 +39,15 @@ func (a *API) AgentAuth(next http.Handler) http.Handler {
 		}
 		token := strings.TrimPrefix(auth, prefix)
 		agent, err := a.store.GetAgentByTokenHash(r.Context(), store.HashToken(token))
-		if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
 			writeErr(w, http.StatusUnauthorized, "invalid agent token")
+			return
+		}
+		if err != nil {
+			// A token that could not be checked is not a bad token: the
+			// agent has to be able to tell this from a refusal and retry.
+			slog.Error("agent auth", "err", err)
+			writeErr(w, http.StatusInternalServerError, "failed to check agent token")
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKeyAgent{}, agent)))

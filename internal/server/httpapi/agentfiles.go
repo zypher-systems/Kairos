@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -41,20 +42,10 @@ func (a *API) handleAgentWatchEvent(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "failed to load job")
 		return
 	}
-	// The event must come from the agent this watch is assigned to: the
-	// job's agent target, or the agent that owns the watched location.
-	assigned := false
-	if job.WatchEnabled {
-		switch job.WatchTarget {
-		case "agent":
-			assigned = job.WatchAgentID != nil && *job.WatchAgentID == agent.ID
-		case "location":
-			if job.WatchLocationID != nil {
-				if loc, err := a.store.GetStorageLocation(r.Context(), *job.WatchLocationID); err == nil {
-					assigned = loc.Kind == "agent" && loc.AgentID != nil && *loc.AgentID == agent.ID
-				}
-			}
-		}
+	assigned, err := a.watchAssigned(r.Context(), job, agent.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to load watched location")
+		return
 	}
 	if !assigned {
 		writeErr(w, http.StatusForbidden, "watch not assigned to this agent")
@@ -202,6 +193,33 @@ func (a *API) handleAgentFileUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("agent uploaded library file", "name", name, "bytes", n, "run", runID, "agent", agent.Name)
 	writeJSON(w, http.StatusCreated, entry)
+}
+
+// watchAssigned reports whether a file event may come from this agent: the
+// job's agent target, or the agent that owns the watched location. A lookup
+// that failed answers nothing, so it is an error and not a no: the agent
+// retries an error and drops a refusal.
+func (a *API) watchAssigned(ctx context.Context, job store.Job, agentID uuid.UUID) (bool, error) {
+	if !job.WatchEnabled {
+		return false, nil
+	}
+	switch job.WatchTarget {
+	case "agent":
+		return job.WatchAgentID != nil && *job.WatchAgentID == agentID, nil
+	case "location":
+		if job.WatchLocationID == nil {
+			return false, nil
+		}
+		loc, err := a.store.GetStorageLocation(ctx, *job.WatchLocationID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return loc.Kind == "agent" && loc.AgentID != nil && *loc.AgentID == agentID, nil
+	}
+	return false, nil
 }
 
 // watchTasksFor returns the watch assignments an agent should run, delivered

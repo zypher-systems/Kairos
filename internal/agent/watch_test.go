@@ -114,10 +114,35 @@ func TestWatchRetryFollowsNewFiles(t *testing.T) {
 	}
 }
 
-// A 4xx will not change on a retry: the job is gone or the watch moved. The
-// report is dropped instead of being repeated on every poll.
-func TestWatchDropsAPermanentRefusal(t *testing.T) {
-	for _, status := range []int{http.StatusNotFound, http.StatusForbidden, http.StatusBadRequest} {
+// Some 4xx answers pass: a proxy timing out, a rate limit, or a token the
+// server could not check. The event stays pending through those.
+func TestWatchRetriesPassing4xx(t *testing.T) {
+	for _, status := range []int{
+		http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests,
+		http.StatusUnauthorized,
+	} {
+		srv := &fakeServer{statuses: []int{status}}
+		hs := httptest.NewServer(srv)
+		dir := t.TempDir()
+		w := NewWatcher(NewClient(hs.URL, "token", "test"))
+		fw := &fileWatch{jobID: uuid.New(), glob: "*.csv", root: dir, interval: time.Second}
+		w.poll(context.Background(), fw)
+		if err := settle(w, fw, dir, "a.csv"); err != nil {
+			t.Fatal(err)
+		}
+		w.poll(context.Background(), fw)
+		w.poll(context.Background(), fw)
+		hs.Close()
+		if got := srv.count(); got != 2 {
+			t.Fatalf("status %d: sent %d times, want the refusal and one accepted retry", status, got)
+		}
+	}
+}
+
+// A definite refusal will not change on a retry: the job is gone or the
+// watch moved. The report is dropped instead of repeating on every poll.
+func TestWatchDropsADefiniteRefusal(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusForbidden, http.StatusBadRequest, http.StatusGone} {
 		srv := &fakeServer{statuses: []int{status}}
 		hs := httptest.NewServer(srv)
 		dir := t.TempDir()

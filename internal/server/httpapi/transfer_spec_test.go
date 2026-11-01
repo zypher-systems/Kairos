@@ -2,8 +2,12 @@ package httpapi
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/google/uuid"
 
 	"github.com/zypher-systems/kairos/internal/server/store"
 	"github.com/zypher-systems/kairos/internal/storage"
@@ -64,5 +68,69 @@ func TestAgentSpecRefusesServerDirectories(t *testing.T) {
 	}
 	if _, err := buildAgentTransferSpec(ctx, st, store.Job{TransferConfig: legacy}, store.Run{}); err != nil {
 		t.Fatalf("legacy agent path: %v", err)
+	}
+}
+
+// A token the server could not check is not a bad token: the agent must see
+// an error it can retry, not a refusal.
+func TestAgentAuthSeparatesFailureFromRefusal(t *testing.T) {
+	st := testutil.Store(t)
+	a := &API{store: st}
+	reached := false
+	h := a.AgentAuth(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached = true }))
+
+	do := func(ctx context.Context) int {
+		r := httptest.NewRequest(http.MethodPost, "/api/v1/agent/watch-event", nil).WithContext(ctx)
+		r.Header.Set("Authorization", "Bearer no-such-token")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+	if got := do(context.Background()); got != http.StatusUnauthorized {
+		t.Fatalf("an unknown token: %d", got)
+	}
+	failed, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := do(failed); got != http.StatusInternalServerError {
+		t.Fatalf("a failed lookup: %d", got)
+	}
+	if reached {
+		t.Fatal("neither request may get through")
+	}
+}
+
+func TestWatchAssignedSeparatesFailureFromRefusal(t *testing.T) {
+	st := testutil.Store(t)
+	ctx := context.Background()
+	a := &API{store: st}
+	ag, _, err := st.CreateAgent(ctx, "edge", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, _, err := st.CreateAgent(ctx, "other", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loc := &store.StorageLocation{Name: "edge-disk", Kind: "agent", AgentID: &ag.ID, BasePath: "/data"}
+	if err := st.CreateStorageLocation(ctx, loc); err != nil {
+		t.Fatal(err)
+	}
+	job := store.Job{WatchEnabled: true, WatchTarget: "location", WatchLocationID: &loc.ID}
+
+	if ok, err := a.watchAssigned(ctx, job, ag.ID); !ok || err != nil {
+		t.Fatalf("the owning agent: %v %v", ok, err)
+	}
+	if ok, err := a.watchAssigned(ctx, job, other.ID); ok || err != nil {
+		t.Fatalf("another agent is a refusal: %v %v", ok, err)
+	}
+	failed, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := a.watchAssigned(failed, job, ag.ID); err == nil {
+		t.Fatal("a failed lookup must be an error, not a refusal")
+	}
+	missing := uuid.New()
+	job.WatchLocationID = &missing
+	if ok, err := a.watchAssigned(ctx, job, ag.ID); ok || err != nil {
+		t.Fatalf("a deleted location is a refusal: %v %v", ok, err)
 	}
 }
